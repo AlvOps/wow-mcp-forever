@@ -95,7 +95,13 @@ Wowhead has no official API. The server reads the same endpoints Wowhead's own s
 
 ```bash
 npm run dev       # run from source
-npm run inspect   # MCP Inspector UI
-npm test          # parser + end-to-end tests against a fake Wowhead
+npm run inspect   # MCP Inspector UI: click the tools, see the raw payloads
+npm test          # 36 parser/state-machine tests, offline, against a fake Wowhead
+npm run selftest  # live check against the real Wowhead from this machine
 npm run lint      # type-check
+
+# Ask the server directly, no assistant in the middle (run npm run build first):
+node scripts/ask.mjs --list
+node scripts/ask.mjs forever_find '{"name":"Hogger","type":"npc","maxRows":3}'
+node scripts/ask.mjs forever_details '{"type":"item","id":1710,"sections":["dropped-by"],"maxRows":5}'
 ```
