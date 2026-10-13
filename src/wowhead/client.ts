@@ -22,23 +22,74 @@ export class HttpError extends Error {
   constructor(
     public readonly status: number,
     public readonly url: string,
+    public readonly reason?: string,
   ) {
-    super(`HTTP ${status} from ${url}`);
+    super(reason ? `${reason} (HTTP ${status} from ${url})` : `HTTP ${status} from ${url}`);
   }
+}
+
+/** Just the part of the token store the client needs, so tests can stub it. */
+export interface TokenSource {
+  getOrMint(force?: boolean): Promise<string | undefined>;
+}
+
+export interface ClientDeps {
+  fetch?: typeof fetch;
+  tokens?: TokenSource;
+}
+
+/**
+ * The AWS WAF JavaScript challenge arrives as HTTP 202 with a
+ * `window.gokuProps` interstitial. 202 is a *successful* status, so a naive
+ * `response.ok` check parses the challenge page as if it were entity data.
+ *
+ * Deliberately NOT testing for `awsWafCookieDomainList`: Wowhead injects that
+ * snippet into real pages as well (verified on a 743KB item page), so it
+ * produces false positives and throws away perfectly good responses.
+ */
+export function isWafChallenge(status: number, text: string): boolean {
+  return status === 202 || text.includes('gokuProps');
 }
 
 export class WowheadClient {
   private cache: TtlCache<string>;
-  private tokens: WafTokenStore;
+  private pages: TtlCache<PageInfo>;
+  private tokens: TokenSource;
   private areas: AreaNames;
+  private doFetch: typeof fetch;
 
-  constructor(private readonly env: Env) {
-    this.cache = new TtlCache<string>(env.CACHE_TTL_SECONDS * 1000, env.CACHE_SIZE);
-    this.tokens = new WafTokenStore(
-      env.WOWHEAD_TOKEN_FILE || join(homedir(), '.wowhead-token'),
-      env.WOWHEAD_CHROME_PATH || undefined,
-      env.WOWHEAD_TOKEN_MAX_AGE_HOURS,
+  constructor(
+    private readonly env: Env,
+    deps: ClientDeps = {},
+  ) {
+    // Raw payloads (search JSON, tooltips, item XML) are small, so cap by bytes
+    // as well as by entry count.
+    this.cache = new TtlCache<string>(
+      env.CACHE_TTL_SECONDS * 1000,
+      env.CACHE_SIZE,
+      env.CACHE_MAX_BYTES,
+      (s) => s.length,
     );
+    // Entity pages are ~250KB-850KB of HTML and are cached *parsed*: keeping the
+    // raw strings was the one way this process could grow to a gigabyte.
+    this.pages = new TtlCache<PageInfo>(env.CACHE_TTL_SECONDS * 1000, env.PAGE_CACHE_SIZE);
+
+    this.doFetch = deps.fetch ?? fetch;
+    this.tokens =
+      deps.tokens ??
+      new WafTokenStore(
+        env.WOWHEAD_TOKEN_FILE || join(homedir(), '.wowhead-token'),
+        env.WOWHEAD_CHROME_PATH || undefined,
+        env.WOWHEAD_TOKEN_MAX_AGE_HOURS,
+        {
+          // Derived from the configured site/env rather than hardcoded.
+          mintUrl: env.WOWHEAD_MINT_URL || `${env.WOWHEAD_BASE_URL}/${env.WOWHEAD_ENV}/items`,
+          deadlineMs: env.MINT_DEADLINE_MS,
+          cookieWaitMs: env.MINT_COOKIE_WAIT_MS,
+          callTimeoutMs: Math.max(5_000, Math.min(20_000, env.MINT_DEADLINE_MS - 5_000)),
+        },
+        env.MINT_FAILURE_BACKOFF_MS,
+      );
     this.areas = new AreaNames(
       `${env.WOWHEAD_TOOLTIP_URL}/${env.WOWHEAD_ENV}/data/global`,
       env.HTTP_TIMEOUT_MS,
@@ -50,9 +101,20 @@ export class WowheadClient {
     return `${this.env.WOWHEAD_BASE_URL}/${this.env.WOWHEAD_ENV}/${typePath}=${id}`;
   }
 
+  /** Human-facing search URL, used to cite where an answer came from. */
+  searchUrl(query: string): string {
+    return `${this.env.WOWHEAD_BASE_URL}/${this.env.WOWHEAD_ENV}/search?q=${encodeURIComponent(query)}`;
+  }
+
+  /** Drop rows with fewer samples than this are ordered after the rest. */
+  get dropMinSamples(): number {
+    return this.env.DROP_MIN_SAMPLES;
+  }
+
   /**
    * A browser-shaped header set. The Sec-Fetch-* headers are not optional:
-   * without them Wowhead's WAF answers 403 instead of the challenge.
+   * without them Wowhead's edge answers 403 (a 919-byte CloudFront error page)
+   * instead of the challenge.
    */
   private requestHeaders(token?: string): Record<string, string> {
     return {
@@ -67,51 +129,62 @@ export class WowheadClient {
     };
   }
 
-  /**
-   * The AWS WAF JavaScript challenge arrives as HTTP 202 with a
-   * `window.gokuProps` interstitial. 202 is a *successful* status, so a naive
-   * `response.ok` check parses the challenge page as if it were entity data.
-   */
-  private static isChallenge(status: number, text: string): boolean {
-    // The challenge is served as HTTP 202 and carries `gokuProps`.
-    // Deliberately NOT testing for `awsWafCookieDomainList`: Wowhead injects that
-    // snippet into real pages as well (verified on a 743KB item page), so it
-    // produces false positives and throws away perfectly good responses.
-    return status === 202 || text.includes('gokuProps');
-  }
-
   // ── Low-level fetch with timeout, retries, token and cache ──
 
   async fetchText(url: string): Promise<string> {
     return (await this.fetchStatus(url)).text;
   }
 
-  private async fetchStatus(url: string): Promise<{ status: number; text: string }> {
-    const cached = this.cache.get(url);
-    if (cached !== undefined) return { status: 200, text: cached };
+  private async fetchStatus(
+    url: string,
+    opts: { cacheText?: boolean } = {},
+  ): Promise<{ status: number; text: string }> {
+    const cacheText = opts.cacheText ?? true;
+    if (cacheText) {
+      const cached = this.cache.get(url);
+      if (cached !== undefined) return { status: 200, text: cached };
+    }
 
     let lastErr: unknown;
-    let refreshed = false;
+    /** At most one token refresh per request, whatever symptom triggered it. */
+    let recovered = false;
 
     for (let attempt = 0; attempt <= this.env.HTTP_RETRY_LIMIT; attempt++) {
       try {
         const token = await this.tokens.getOrMint();
-        const res = await fetch(url, {
+        const res = await this.doFetch(url, {
           headers: this.requestHeaders(token),
           redirect: 'follow',
           signal: AbortSignal.timeout(this.env.HTTP_TIMEOUT_MS),
         });
         const text = await res.text();
 
-        if (WowheadClient.isChallenge(res.status, text)) {
-          lastErr = new Error(`Wowhead served the AWS WAF challenge (HTTP ${res.status}) for ${url}`);
-          if (!refreshed) {
-            refreshed = true;
+        if (isWafChallenge(res.status, text)) {
+          if (!recovered) {
+            recovered = true;
             logger.info({ url }, 'WAF challenge received: re-minting the token and retrying');
             await this.tokens.getOrMint(true);
             continue;
           }
-          break; // token re-mint did not clear it; give up rather than loop
+          throw new HttpError(
+            res.status,
+            url,
+            'Wowhead served the AWS WAF challenge and a fresh token did not clear it',
+          );
+        }
+
+        if (res.status === 403) {
+          // A 403 here is the edge refusing a non-browser-shaped request rather
+          // than a challenge (a stale cookie still passes; a *missing* cookie
+          // yields the 202 challenge above). A rejected token can look the same,
+          // so refresh once before giving up.
+          if (!recovered) {
+            recovered = true;
+            logger.info({ url }, 'HTTP 403 received: re-minting the token and retrying once');
+            await this.tokens.getOrMint(true);
+            continue;
+          }
+          throw new HttpError(403, url, 'Wowhead refused the request (HTTP 403) twice');
         }
 
         if (!res.ok) {
@@ -125,7 +198,7 @@ export class WowheadClient {
           throw err;
         }
 
-        this.cache.set(url, text);
+        if (cacheText) this.cache.set(url, text);
         return { status: res.status, text };
       } catch (err) {
         if (err instanceof HttpError && err.status < 500 && err.status !== 429) throw err;
@@ -232,19 +305,36 @@ export class WowheadClient {
 
   async page(type: EntityType, id: number): Promise<PageInfo> {
     const url = this.pageUrl(type.path, id);
-    const { status, text } = await this.fetchStatus(url);
-    if (status === 404) throw new HttpError(404, url);
+    const cached = this.pages.get(url);
+    if (cached) return cached;
 
-    // An id that does not exist answers with the site-wide listing page rather
-    // than a 404. It parses cleanly and would be reported as real data, so it
-    // has to be rejected explicitly.
-    const title = /<title>([^<]*)</i.exec(text)?.[1]?.trim() ?? '';
-    if (/^forever items$/i.test(title)) {
-      logger.debug({ url, title }, 'entity id resolved to the site listing page');
-      throw new HttpError(404, url);
+    // Raw HTML is deliberately not kept: only the parsed page is cached.
+    const { text } = await this.fetchStatus(url, { cacheText: false });
+    const rawTitle = /<title>([\s\S]*?)<\/title>/i.exec(text)?.[1]?.trim() ?? '';
+    if (!this.looksLikeEntity(text, rawTitle, type.path, id)) {
+      logger.debug({ url, rawTitle }, 'entity id resolved to a listing page');
+      throw new HttpError(404, url, 'Wowhead has no such entity');
     }
 
-    return parsePage(text);
+    const info = parsePage(text);
+    this.pages.set(url, info);
+    return info;
+  }
+
+  /**
+   * Ids that don't exist answer with a site-wide *listing* page: a 200 for
+   * /forever/items, a 404 whose body is "Forever NPCs" for /forever/npc=99999999.
+   * Either body parses cleanly and would be reported as real data. The page's
+   * own canonical link names the resource it belongs to, so a mismatch is the
+   * reliable tell — far better than matching one hardcoded title.
+   */
+  private looksLikeEntity(html: string, rawTitle: string, typePath: string, id: number): boolean {
+    const canonical =
+      /<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i.exec(html)?.[1] ??
+      /<meta[^>]+property=["']og:url["'][^>]*content=["']([^"']+)["']/i.exec(html)?.[1];
+    if (canonical) return canonical.includes(`${typePath}=${id}`);
+    // No canonical at all: fall back to the listing-page titles.
+    return !/^forever\s+[a-z]+s$/i.test(rawTitle);
   }
 }
 

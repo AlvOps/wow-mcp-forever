@@ -15,6 +15,18 @@ Forked from [brunofin/wow-mcp](https://github.com/brunofin/wow-mcp). The retail 
 
 Types: `item`, `quest`, `npc`, `spell`, `object`, `zone`, `faction`, `itemset`, `achievement`, `title`, `event`, `class`, `race`, `skill`, `currency`.
 
+Every response ends with a `source` field — the Wowhead URL the answer came from, so it can be cited:
+
+```json
+"source": { "label": "Wowhead: WoW Forever", "url": "https://www.wowhead.com/forever/item=1710" }
+```
+
+Answers are quality-adjusted rather than raw:
+
+- Data tables keep the numeric `location` ids **and** add `locations` with area names taken from Wowhead's own table — a model given bare ids fills in zone names from its own knowledge, which reads as authoritative but is not the data source speaking.
+- Drop tables report `samples` (the kill count behind a rate) and are ordered by drop chance with rows below `DROP_MIN_SAMPLES` last, so *100% of 6 kills* cannot outrank a real drop rate.
+- Transmog, comment, screenshot and video tables are omitted unless explicitly requested through `sections`; they stay listed in `availableTables`.
+
 ## Install
 
 Requires Node.js 20+.
@@ -66,10 +78,15 @@ Everything is optional; see [`.env.example`](.env.example).
 
 Wowhead has no official API. The server reads the same endpoints Wowhead's own site uses: search suggestions, the tooltip service, item XML and the entity pages, whose data tables it parses. Responses are cached for an hour to keep traffic light.
 
-- Wowhead sits behind AWS WAF (CloudFront). Requests that don't look like a browser get a `403`, so the client sends `Sec-Fetch-*` headers; `sec-fetch-site: none` is what gets it through.
-- Entity pages (`/forever/item=`, `/npc=`, `/quest=`, `/zone=`, `/items`) answer an **AWS WAF JavaScript challenge** (`HTTP 202` + `x-amzn-waf-action: challenge`) to plain HTTP clients. Note that `202` is a *successful* status — a plain `response.ok` check will happily parse the challenge page as if it were item data.
-- To get past it the server mints the `aws-waf-token` cookie with a headless Chromium and then goes back to being an ordinary HTTP client. The token is **not bound to the client IP or the User-Agent**, so it is minted once (~12s, whenever the cached one is older than `WOWHEAD_TOKEN_MAX_AGE_HOURS`, default 72) and reused from anywhere until it expires. That Chromium carries **no `HeadlessChrome` in its User-Agent** — the default headless UA is blocked outright with `403`.
+- Wowhead sits behind AWS WAF (CloudFront), and the three failure modes look nothing alike (all measured):
+  - **no browser-shaped headers → `403`**, a 919-byte "ERROR: The request could not be satisfied" page. This is the edge refusing the request, *not* a token problem. The client always sends `Sec-Fetch-*` with `sec-fetch-site: none`.
+  - **headers but no cookie → `202`** carrying `window.gokuProps`: the AWS WAF JavaScript challenge. `202` is a *successful* status, so a plain `response.ok` check parses the challenge page as if it were entity data.
+  - **headers and any cookie → `200`** with the real page. A stale token therefore degrades to the `202` case rather than to `403`.
+- Getting past it: the server mints the `aws-waf-token` cookie with a headless Chromium and then goes back to being an ordinary HTTP client. The token is **not bound to the client IP or the User-Agent**. Chromium must carry a real User-Agent — the default headless UA is blocked with `403` — hence the explicit `--user-agent`.
+- On a `202` **or** a `403` the client re-mints the token once and retries, then fails with a precise message instead of blaming the IP. Minting is bounded: a hard deadline (`MINT_DEADLINE_MS`), a per-CDP-command timeout, and a backoff (`MINT_FAILURE_BACKOFF_MS`) after a failure so a broken Chromium cannot cost a browser spawn on every request.
+- Ids that don't exist come back as site-wide *catalog* pages, not clean 404s: `/forever/items` answers `200`, `/forever/npc=99999999` answers `404` whose body is titled `Forever NPCs`. Both parse cleanly and would be reported as real data. The client compares the page's own `rel="canonical"` link against the entity it asked for, so a listing can never be passed off as an entity.
 - Requirements: a Chromium binary (auto-detected from `PATH` or Playwright's `~/.cache/ms-playwright`), Node 22+ (for the global `WebSocket` used to read the cookie over CDP), and `~/.wowhead-token` for the cached token.
+- Caching: small payloads are cached by entry count *and* byte budget; entity pages are cached **parsed**, so the raw 250KB–850KB HTML is never retained (that was the only way this process could grow to a gigabyte).
 - If Wowhead changes its page format, `forever_details` may return fewer tables. `npm run selftest` shows what still works.
 - WoW: Forever is new, so Wowhead's data is still filling in; some drop rates are missing or based on Classic.
 - Use this for personal use, at modest volume, and respect Wowhead's terms.

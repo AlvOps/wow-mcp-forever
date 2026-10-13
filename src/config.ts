@@ -15,6 +15,14 @@ const envSchema = z.object({
   WOWHEAD_TOKEN_FILE: z.string().default(''),
   WOWHEAD_CHROME_PATH: z.string().default(''),
   WOWHEAD_TOKEN_MAX_AGE_HOURS: z.coerce.number().int().positive().default(72),
+  // Page loaded to mint the cookie. Empty -> <WOWHEAD_BASE_URL>/<WOWHEAD_ENV>/items.
+  WOWHEAD_MINT_URL: z.string().default(''),
+  // Hard ceiling on one mint, so a wedged Chromium cannot hang a tool call.
+  MINT_DEADLINE_MS: z.coerce.number().int().positive().default(45_000),
+  // How long to watch for the challenge cookie before giving up on a mint.
+  MINT_COOKIE_WAIT_MS: z.coerce.number().int().positive().default(20_000),
+  // After a failed mint, don't spawn another browser for this long.
+  MINT_FAILURE_BACKOFF_MS: z.coerce.number().int().min(0).default(600_000),
 
   // Transport: "stdio" (Hermes launches the server) or "http".
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
@@ -28,7 +36,15 @@ const envSchema = z.object({
   HTTP_RETRY_LIMIT: z.coerce.number().int().min(0).default(2),
   // Game data changes slowly; cache Wowhead responses for an hour by default.
   CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(3600),
-  CACHE_SIZE: z.coerce.number().int().min(0).default(1000),
+  // Raw response cache. Small payloads only (search/tooltip/xml): entity page
+  // HTML is cached parsed, see PAGE_CACHE_SIZE.
+  CACHE_SIZE: z.coerce.number().int().min(0).default(200),
+  CACHE_MAX_BYTES: z.coerce.number().int().min(0).default(8_000_000),
+  // Parsed entity pages held in memory (counts entries, not bytes).
+  PAGE_CACHE_SIZE: z.coerce.number().int().min(0).default(60),
+  // Drop tables: rows below this sample size are sorted after the rest, so
+  // "100% of 6 kills" cannot outrank a real drop rate.
+  DROP_MIN_SAMPLES: z.coerce.number().int().min(0).default(20),
 });
 
 export type Env = z.infer<typeof envSchema>;

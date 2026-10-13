@@ -71,6 +71,17 @@ export function formatMoney(copper: number): string {
   return [g ? `${g}g` : '', s ? `${s}s` : '', c ? `${c}c` : ''].filter(Boolean).join(' ');
 }
 
+/**
+ * "<title>" text for a page is really "Hogger - NPC - Forever"; the page name
+ * is the interesting part, so drop the type and site suffix.
+ */
+export function cleanTitle(raw: string): string {
+  return raw
+    .replace(/\s*-\s*(Wowhead|World of Warcraft).*$/i, '')
+    .replace(/\s*-\s*[^-]+?\s*-\s*Forever\s*$/i, '')
+    .trim();
+}
+
 // ── Balanced extraction for embedded JS literals ───────
 
 /**
@@ -104,18 +115,118 @@ export function extractBalanced(src: string, start: number): string | undefined 
   return undefined;
 }
 
+/** Read a JS string literal at `start` and return its decoded content. */
+function readJsString(text: string, start: number): { decoded: string; next: number } {
+  const quote = text[start]!;
+  let decoded = '';
+  let i = start + 1;
+  while (i < text.length) {
+    const ch = text[i]!;
+    if (ch === '\\') {
+      const esc = text[i + 1] ?? '';
+      decoded += esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc === 'b' ? '\b' : esc;
+      i += 2;
+      continue;
+    }
+    if (ch === quote) return { decoded, next: i + 1 };
+    decoded += ch;
+    i++;
+  }
+  return { decoded, next: i };
+}
+
+/** A bare (unquoted) object key followed by ':' at this position, if any. */
+function bareKeyAt(text: string, i: number): { key: string; next: number } | undefined {
+  const m = /^\s*([A-Za-z_$][\w$]*)\s*:/.exec(text.slice(i));
+  if (!m) return undefined;
+  return { key: m[1]!, next: i + m[0].length };
+}
+
+/**
+ * Repair a JS object/array literal so JSON.parse accepts it: quote bare keys,
+ * drop trailing commas, turn a bare `undefined` value into null.
+ *
+ * This must skip string literals. A regex such as /([{,]\s*)(key)\s*:/ also
+ * rewrites text that merely looks like a key *inside* a value, and a broken
+ * literal degrades to rows=[] silently rather than raising — a whole table
+ * disappears with no error anywhere.
+ */
+export function repairJsObjectLiteral(text: string): string {
+  let out = '';
+  let depth = 0;
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i]!;
+
+    // String literals are re-encoded as strict JSON and never scanned for keys.
+    // Single quotes and backticks are legal JS but not JSON — another way a
+    // table could come back silently empty.
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const { decoded, next } = readJsString(text, i);
+      out += JSON.stringify(decoded);
+      i = next;
+      continue;
+    }
+
+    if (ch === '{' || ch === '[') {
+      depth++;
+      out += ch;
+      i++;
+      if (ch === '{') {
+        const bare = bareKeyAt(text, i);
+        if (bare) {
+          out += `"${bare.key}":`;
+          i = bare.next;
+        }
+      }
+      continue;
+    }
+
+    if (ch === '}' || ch === ']') {
+      depth--;
+      out += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === ',') {
+      // Trailing comma: drop it.
+      if (depth > 0 && /^\s*[}\]]/.test(text.slice(i + 1))) {
+        i++;
+        continue;
+      }
+      out += ch;
+      i++;
+      const bare = bareKeyAt(text, i);
+      if (bare && depth > 0) {
+        out += `"${bare.key}":`;
+        i = bare.next;
+      }
+      continue;
+    }
+
+    // `undefined` is legal JS but not JSON — only rewrite it in value position.
+    if (text.startsWith('undefined', i) && /:\s*$/.test(out)) {
+      out += 'null';
+      i += 'undefined'.length;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
+}
+
 /** JSON.parse that also tolerates a few common JS-literal quirks. */
 export function lenientJson(text: string): unknown {
   try {
     return JSON.parse(text);
   } catch {
-    // Quote bare keys and drop trailing commas, then retry.
-    const fixed = text
-      .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')
-      .replace(/,\s*([}\]])/g, '$1')
-      .replace(/:\s*undefined\b/g, ':null');
     try {
-      return JSON.parse(fixed);
+      return JSON.parse(repairJsObjectLiteral(text));
     } catch {
       return undefined;
     }
@@ -220,6 +331,9 @@ export function summarizeRow(row: Record<string, unknown>, template?: string): R
   }
   if (typeof row['count'] === 'number' && typeof row['outof'] === 'number' && row['outof'] > 0) {
     out['dropChance'] = `${((row['count'] / row['outof']) * 100).toFixed(2)}%`;
+    // Keep the sample size. "100% of 6 kills" and "100% of 30000 kills" must not
+    // arrive looking equally authoritative.
+    out['samples'] = row['outof'];
     delete out['count'];
     delete out['outof'];
   }
@@ -251,7 +365,7 @@ function metaContent(html: string, attr: string, value: string): string | undefi
 
 export function parsePage(html: string): PageInfo {
   const titleRaw = /<title>([\s\S]*?)<\/title>/i.exec(html)?.[1];
-  const title = titleRaw ? decodeEntities(titleRaw).replace(/\s*-\s*(Wowhead|World of Warcraft).*$/i, '').trim() : undefined;
+  const title = titleRaw ? cleanTitle(decodeEntities(titleRaw)) : undefined;
   const description = metaContent(html, 'name', 'description') ?? metaContent(html, 'property', 'og:description');
 
   // Quick Facts infobox: WH.markup.printHtml("[ul][li]...", "infobox-contents-0")

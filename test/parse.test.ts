@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  cleanTitle,
   formatMoney,
   htmlToText,
+  lenientJson,
   markupToText,
   parseItemXml,
   parsePage,
@@ -68,6 +70,40 @@ test('parseItemXml reads core fields', () => {
   assert.equal(x['subclass'], 'Shield');
   assert.deepEqual(x['equip'], { armor: 1450, sta: 7 });
   assert.equal(parseItemXml('<wowhead><error>Item not found!</error></wowhead>'), undefined);
+});
+
+test('summarizeRow keeps the sample size behind a drop chance', () => {
+  // "100% of 6 kills" and "100% of 30000 kills" must not look alike.
+  const row = summarizeRow({ name: 'Weak Wolf', count: 6, outof: 6 });
+  assert.equal(row['dropChance'], '100.00%');
+  assert.equal(row['samples'], 6);
+  assert.equal(row['count'], undefined);
+});
+
+test('cleanTitle drops the type and site suffix', () => {
+  assert.equal(cleanTitle('Hogger - NPC - Forever'), 'Hogger');
+  assert.equal(cleanTitle('Defender of Dalaran - Item - Forever'), 'Defender of Dalaran');
+  assert.equal(cleanTitle('Thunderfury, Blessed Blade of the Windseeker - Item - Forever'),
+    'Thunderfury, Blessed Blade of the Windseeker');
+  // A listing page has no type suffix and must be left alone.
+  assert.equal(cleanTitle('Forever Items'), 'Forever Items');
+  assert.equal(cleanTitle('Some Page - Wowhead'), 'Some Page');
+});
+
+test('repairJsObjectLiteral never rewrites inside string values', () => {
+  // The old regex-based repair turned this value into garbage, silently emptying
+  // a whole table. Text that merely looks like a key must survive untouched.
+  const literal = `{id:1,name:'say {a: 1} and, "b": 2',trailing:1,}`;
+  const parsed = lenientJson(literal) as Record<string, unknown>;
+  assert.equal(parsed['name'], 'say {a: 1} and, "b": 2');
+  assert.equal(parsed['id'], 1);
+  assert.equal(parsed['trailing'], 1);
+  assert.deepEqual(lenientJson('{a:undefined}'), { a: null });
+});
+
+test('lenientJson still parses strict JSON and gives up quietly on junk', () => {
+  assert.deepEqual(lenientJson('{"a":1}'), { a: 1 });
+  assert.equal(lenientJson('not json at all'), undefined);
 });
 
 test('text helpers', () => {

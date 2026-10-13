@@ -9,6 +9,10 @@
  *
  * So we mint a token with headless Chromium when we don't have a fresh one, and
  * otherwise stay an ordinary HTTP client.
+ *
+ * Minting is the fragile part and is treated as such: a wedged browser must
+ * never hang a tool call, and a broken Chromium must not cost a 30s spawn on
+ * every single request.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -23,12 +27,20 @@ import { logger } from '../util/logger.js';
 export const REAL_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36';
 
-/** Any challenged page works and it only has to load enough to set the cookie. */
-const MINT_URL = 'https://www.wowhead.com/forever/items';
-
 interface StoredToken {
   token: string;
   mintedAt: number;
+}
+
+export interface MintOptions {
+  /** Page to load; any challenged page works, it only has to set the cookie. */
+  mintUrl: string;
+  /** Hard ceiling on one mint, start to finish. */
+  deadlineMs: number;
+  /** How long to watch for the cookie before giving up. */
+  cookieWaitMs: number;
+  /** Per-CDP-command timeout. */
+  callTimeoutMs: number;
 }
 
 function which(bin: string): string | undefined {
@@ -55,14 +67,38 @@ export function findChrome(explicit?: string): string | undefined {
   return undefined;
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Reject a promise that takes too long, so nothing can hang a tool call. */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
 export class WafTokenStore {
   /** One mint at a time: parallel fetches must not each launch a browser. */
   private inFlight?: Promise<string | undefined>;
+  private lastFailureAt?: number;
 
   constructor(
     private readonly file: string,
     private readonly chromePath: string | undefined,
     private readonly maxAgeHours: number,
+    private readonly mint: MintOptions,
+    private readonly failureBackoffMs = 600_000,
   ) {}
 
   /** A token we already hold that is still considered fresh. */
@@ -76,31 +112,44 @@ export class WafTokenStore {
 
   /**
    * Fresh token if we have one, otherwise mint one with a browser.
-   * Pass `force` after Wowhead served a challenge despite a token we believed
-   * was still good.
+   *
+   * Pass `force` after Wowhead served a challenge — or refused the request —
+   * despite a token we believed was still good. Forcing bypasses the failure
+   * backoff, so callers must force at most once per request.
    */
   async getOrMint(force = false): Promise<string | undefined> {
     const cached = force ? undefined : this.get();
     if (cached) return cached;
     if (this.inFlight) return this.inFlight;
-    this.inFlight = this.mint().finally(() => {
+    if (!force && this.lastFailureAt && Date.now() - this.lastFailureAt < this.failureBackoffMs) {
+      logger.debug('skipping token mint: a recent attempt failed, backing off');
+      return undefined;
+    }
+    this.inFlight = this.mintOnce().finally(() => {
       this.inFlight = undefined;
     });
     return this.inFlight;
   }
 
-  private async mint(): Promise<string | undefined> {
+  private async mintOnce(): Promise<string | undefined> {
     const chrome = this.chromePath ?? findChrome();
     if (!chrome) {
+      // Don't record a failure: installing Chromium should be picked up at once.
       logger.warn('no Chromium found: cannot mint an aws-waf-token, entity pages will fail');
       return undefined;
     }
     try {
-      const token = await mintWithBrowser(chrome, MINT_URL);
-      if (!token) return undefined;
+      const token = await mintWithBrowser(chrome, this.mint.mintUrl, this.mint);
+      if (!token) {
+        this.lastFailureAt = Date.now();
+        logger.warn({ url: this.mint.mintUrl }, 'no aws-waf-token was set; backing off before another attempt');
+        return undefined;
+      }
       this.write(token);
+      this.lastFailureAt = undefined;
       return token;
     } catch (err) {
+      this.lastFailureAt = Date.now();
       logger.error({ err }, 'aws-waf-token mint failed');
       return undefined;
     }
@@ -137,7 +186,7 @@ async function waitForTarget(port: number, timeoutMs: number): Promise<{ webSock
     } catch {
       /* browser not up yet */
     }
-    await new Promise((r) => setTimeout(r, 400));
+    await sleep(250);
   }
   return undefined;
 }
@@ -146,8 +195,13 @@ async function waitForTarget(port: number, timeoutMs: number): Promise<{ webSock
  * Load a challenged page in headless Chromium and read the decrypted
  * `aws-waf-token` cookie back over CDP. (Reading it from the on-disk cookie
  * store does NOT work — Chromium keeps the value encrypted.)
+ *
+ * Bounded end to end: the whole attempt races a deadline, every CDP command has
+ * its own timeout, and the browser is killed on every exit path. A wedged
+ * Chromium therefore fails a tool call in `deadlineMs` instead of hanging it
+ * forever, which is what an un-timed CDP promise would do.
  */
-export async function mintWithBrowser(chrome: string, url: string): Promise<string | undefined> {
+export async function mintWithBrowser(chrome: string, url: string, opts: MintOptions): Promise<string | undefined> {
   const WS = (globalThis as { WebSocket?: unknown }).WebSocket as
     | (new (url: string) => WebSocket)
     | undefined;
@@ -170,17 +224,25 @@ export async function mintWithBrowser(chrome: string, url: string): Promise<stri
     { stdio: 'ignore' },
   );
 
-  try {
-    const target = await waitForTarget(port, 30_000);
+  const work = (async (): Promise<string | undefined> => {
+    const target = await waitForTarget(port, Math.min(30_000, opts.deadlineMs));
     if (!target) throw new Error('Chromium did not expose a CDP target');
 
     const ws = new WS(target.webSocketDebuggerUrl);
     let nextId = 0;
     const pending = new Map<number, (msg: any) => void>();
+
     const call = (method: string, params: Record<string, unknown> = {}) =>
-      new Promise<any>((resolve) => {
+      new Promise<any>((resolve, reject) => {
         const id = ++nextId;
-        pending.set(id, resolve);
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`CDP ${method} timed out after ${opts.callTimeoutMs}ms`));
+        }, opts.callTimeoutMs);
+        pending.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
         ws.send(JSON.stringify({ id, method, params }));
       });
 
@@ -196,21 +258,32 @@ export async function mintWithBrowser(chrome: string, url: string): Promise<stri
       }
     });
 
-    await new Promise<void>((resolve, reject) => {
-      ws.addEventListener('open', () => resolve());
-      ws.addEventListener('error', () => reject(new Error('CDP socket error')));
-    });
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        ws.addEventListener('open', () => resolve());
+        ws.addEventListener('error', () => reject(new Error('CDP socket error')));
+      }),
+      opts.callTimeoutMs,
+      'CDP socket open',
+    );
 
     await call('Network.enable');
     await call('Page.enable');
     await call('Page.navigate', { url });
-    // The challenge script runs after load; give it room to set the cookie.
-    await new Promise((r) => setTimeout(r, 12_000));
 
-    const cookies = await call('Network.getAllCookies');
-    const token = (cookies?.result?.cookies ?? []).find(
-      (c: { name: string; value: string }) => c.name === 'aws-waf-token',
-    )?.value as string | undefined;
+    // Poll for the cookie rather than sleeping a fixed window: the challenge
+    // usually lands in 1-3s, and waiting the full timeout on every mint is dead
+    // time on the request that triggered it.
+    const deadline = Date.now() + opts.cookieWaitMs;
+    let token: string | undefined;
+    while (Date.now() < deadline) {
+      const cookies = await call('Network.getAllCookies');
+      token = (cookies?.result?.cookies ?? []).find(
+        (c: { name: string; value: string }) => c.name === 'aws-waf-token',
+      )?.value as string | undefined;
+      if (token) break;
+      await sleep(400);
+    }
 
     try {
       ws.close();
@@ -218,7 +291,12 @@ export async function mintWithBrowser(chrome: string, url: string): Promise<stri
       /* already closing */
     }
     return token || undefined;
+  })();
+
+  try {
+    return await withTimeout(work, opts.deadlineMs, 'aws-waf-token mint');
   } finally {
+    // Runs on success, failure AND deadline: no orphaned browser, no stashed profile.
     child.kill('SIGKILL');
     rmSync(profile, { recursive: true, force: true });
   }
