@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { Env } from '../config.js';
 import { TtlCache } from '../util/cache.js';
 import { logger } from '../util/logger.js';
@@ -12,10 +14,8 @@ import {
   parseTooltip,
   summarizeRow,
 } from './parse.js';
+import { REAL_UA, WafTokenStore } from './token.js';
 import { type EntityType, typeByName } from './types.js';
-
-const USER_AGENT =
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36 wow-forever-mcp';
 
 export class HttpError extends Error {
   constructor(
@@ -28,37 +28,85 @@ export class HttpError extends Error {
 
 export class WowheadClient {
   private cache: TtlCache<string>;
+  private tokens: WafTokenStore;
 
   constructor(private readonly env: Env) {
     this.cache = new TtlCache<string>(env.CACHE_TTL_SECONDS * 1000, env.CACHE_SIZE);
+    this.tokens = new WafTokenStore(
+      env.WOWHEAD_TOKEN_FILE || join(homedir(), '.wowhead-token'),
+      env.WOWHEAD_CHROME_PATH || undefined,
+      env.WOWHEAD_TOKEN_MAX_AGE_HOURS,
+    );
   }
 
   pageUrl(typePath: string, id: number): string {
     return `${this.env.WOWHEAD_BASE_URL}/${this.env.WOWHEAD_ENV}/${typePath}=${id}`;
   }
 
-  // ── Low-level fetch with timeout, retries and cache ──
+  /**
+   * A browser-shaped header set. The Sec-Fetch-* headers are not optional:
+   * without them Wowhead's WAF answers 403 instead of the challenge.
+   */
+  private requestHeaders(token?: string): Record<string, string> {
+    return {
+      'user-agent': REAL_UA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+      'sec-fetch-site': 'none',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-dest': 'document',
+      'upgrade-insecure-requests': '1',
+      ...(token ? { cookie: `aws-waf-token=${token}` } : {}),
+    };
+  }
+
+  /**
+   * The AWS WAF JavaScript challenge arrives as HTTP 202 with a
+   * `window.gokuProps` interstitial. 202 is a *successful* status, so a naive
+   * `response.ok` check parses the challenge page as if it were entity data.
+   */
+  private static isChallenge(status: number, text: string): boolean {
+    // The challenge is served as HTTP 202 and carries `gokuProps`.
+    // Deliberately NOT testing for `awsWafCookieDomainList`: Wowhead injects that
+    // snippet into real pages as well (verified on a 743KB item page), so it
+    // produces false positives and throws away perfectly good responses.
+    return status === 202 || text.includes('gokuProps');
+  }
+
+  // ── Low-level fetch with timeout, retries, token and cache ──
 
   async fetchText(url: string): Promise<string> {
+    return (await this.fetchStatus(url)).text;
+  }
+
+  private async fetchStatus(url: string): Promise<{ status: number; text: string }> {
     const cached = this.cache.get(url);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return { status: 200, text: cached };
 
     let lastErr: unknown;
+    let refreshed = false;
+
     for (let attempt = 0; attempt <= this.env.HTTP_RETRY_LIMIT; attempt++) {
       try {
+        const token = await this.tokens.getOrMint();
         const res = await fetch(url, {
-          headers: {
-            'user-agent': USER_AGENT,
-            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'accept-language': 'en-US,en;q=0.9',
-            'sec-fetch-site': 'none',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-dest': 'document',
-            'upgrade-insecure-requests': '1',
-          },
+          headers: this.requestHeaders(token),
           redirect: 'follow',
           signal: AbortSignal.timeout(this.env.HTTP_TIMEOUT_MS),
         });
+        const text = await res.text();
+
+        if (WowheadClient.isChallenge(res.status, text)) {
+          lastErr = new Error(`Wowhead served the AWS WAF challenge (HTTP ${res.status}) for ${url}`);
+          if (!refreshed) {
+            refreshed = true;
+            logger.info({ url }, 'WAF challenge received: re-minting the token and retrying');
+            await this.tokens.getOrMint(true);
+            continue;
+          }
+          break; // token re-mint did not clear it; give up rather than loop
+        }
+
         if (!res.ok) {
           const err = new HttpError(res.status, url);
           // Only retry rate limits and server errors.
@@ -69,9 +117,9 @@ export class WowheadClient {
           }
           throw err;
         }
-        const text = await res.text();
+
         this.cache.set(url, text);
-        return text;
+        return { status: res.status, text };
       } catch (err) {
         if (err instanceof HttpError && err.status < 500 && err.status !== 429) throw err;
         lastErr = err;
@@ -168,7 +216,20 @@ export class WowheadClient {
   // ── Full entity page (drops, quest chains, vendors, ...) ──
 
   async page(type: EntityType, id: number): Promise<PageInfo> {
-    return parsePage(await this.fetchText(this.pageUrl(type.path, id)));
+    const url = this.pageUrl(type.path, id);
+    const { status, text } = await this.fetchStatus(url);
+    if (status === 404) throw new HttpError(404, url);
+
+    // An id that does not exist answers with the site-wide listing page rather
+    // than a 404. It parses cleanly and would be reported as real data, so it
+    // has to be rejected explicitly.
+    const title = /<title>([^<]*)</i.exec(text)?.[1]?.trim() ?? '';
+    if (/^forever items$/i.test(title)) {
+      logger.debug({ url, title }, 'entity id resolved to the site listing page');
+      throw new HttpError(404, url);
+    }
+
+    return parsePage(text);
   }
 }
 

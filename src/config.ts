@@ -9,6 +9,13 @@ const envSchema = z.object({
   WOWHEAD_BASE_URL: z.string().url().default('https://www.wowhead.com'),
   WOWHEAD_TOOLTIP_URL: z.string().url().default('https://nether.wowhead.com'),
 
+  // Entity pages are behind an AWS WAF JS challenge. A token minted by a real
+  // browser (the aws-waf-token cookie) lets plain fetches through for days.
+  // Empty path -> ~/.wowhead-token. Empty chrome path -> auto-detect.
+  WOWHEAD_TOKEN_FILE: z.string().default(''),
+  WOWHEAD_CHROME_PATH: z.string().default(''),
+  WOWHEAD_TOKEN_MAX_AGE_HOURS: z.coerce.number().int().positive().default(72),
+
   // Transport: "stdio" (Hermes launches the server) or "http".
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   PORT: z.coerce.number().int().positive().default(3000),
