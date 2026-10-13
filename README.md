@@ -2,7 +2,7 @@
 
 An MCP server that lets an AI assistant answer questions about **World of Warcraft: Forever** using the [Wowhead Forever database](https://www.wowhead.com/forever).
 
-Forked from [brunofin/wow-mcp](https://github.com/brunofin/wow-mcp). The retail Blizzard API tools, OAuth and Postgres were removed. No API keys are needed.
+The retail Blizzard API tools, OAuth and Postgres have been removed — this server talks to Wowhead only. No API keys are needed.
 
 ## Tools
 

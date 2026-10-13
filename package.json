@@ -4,6 +4,12 @@
   "description": "MCP server for World of Warcraft: Forever game data, backed by Wowhead",
   "type": "module",
   "private": true,
+  "author": "AlvOps",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlvOps/wow-mcp-forever.git"
+  },
   "bin": {
     "wow-forever-mcp": "./dist/index.js"
   },
