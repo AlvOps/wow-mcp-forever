@@ -66,6 +66,8 @@ Everything is optional; see [`.env.example`](.env.example).
 
 Wowhead has no official API. The server reads the same endpoints Wowhead's own site uses: search suggestions, the tooltip service, item XML and the entity pages, whose data tables it parses. Responses are cached for an hour to keep traffic light.
 
+- Wowhead sits behind AWS WAF (CloudFront). Requests that don't look like a browser get a `403`, so the client sends `Sec-Fetch-*` headers; `sec-fetch-site: none` is what gets it through.
+- Entity pages (`/forever/item=`, `/npc=`, `/quest=`, `/zone=`, `/items`) answer an **AWS WAF JavaScript challenge** (`HTTP 202` + `x-amzn-waf-action: challenge`) to plain HTTP clients. `forever_details` and `forever_find` read those pages, so **they currently return no data**. Passing the challenge needs a real browser to mint an `aws-waf-token` cookie.
 - If Wowhead changes its page format, `forever_details` may return fewer tables. `npm run selftest` shows what still works.
 - WoW: Forever is new, so Wowhead's data is still filling in; some drop rates are missing or based on Classic.
 - Use this for personal use, at modest volume, and respect Wowhead's terms.

@@ -47,7 +47,15 @@ export class WowheadClient {
     for (let attempt = 0; attempt <= this.env.HTTP_RETRY_LIMIT; attempt++) {
       try {
         const res = await fetch(url, {
-          headers: { 'user-agent': USER_AGENT, accept: 'text/html,application/json,application/xml;q=0.9,*/*;q=0.8' },
+          headers: {
+            'user-agent': USER_AGENT,
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            'sec-fetch-site': 'none',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-dest': 'document',
+            'upgrade-insecure-requests': '1',
+          },
           redirect: 'follow',
           signal: AbortSignal.timeout(this.env.HTTP_TIMEOUT_MS),
         });
