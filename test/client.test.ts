@@ -221,7 +221,7 @@ test('shapePage sinks low-sample flukes below real drop rates', async () => {
   assert.deepEqual(drop.rows.map((r) => r['name']), ['Solid Wolf', 'Fluke Wolf'],
     '28% of 100 must outrank 100% of 6');
   assert.equal(drop.rows[0]!['samples'], 100, 'the sample size travels with the rate');
-  assert.deepEqual(drop.rows[0]!['locations'], ['Desolace'], 'zone names come from the data');
+  assert.equal(drop.rows[0]!['zone'], 'Desolace', 'zone names come from the data');
   assert.equal(drop.rowsOnPage, 2);
   assert.match(String(drop.sortedBy), /dropChance desc/);
 });

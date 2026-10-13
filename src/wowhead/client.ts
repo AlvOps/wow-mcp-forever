@@ -15,8 +15,11 @@ import {
   summarizeRow,
 } from './parse.js';
 import { REAL_UA, WafTokenStore } from './token.js';
-import { type EntityType, typeByName } from './types.js';
-import { AreaNames } from './zones.js';
+import { type EntityType, typeById, typeByName } from './types.js';
+import { AreaNames, type GlobalNames } from './zones.js';
+
+/** Max tooltip requests in flight while naming ids a page did not name itself. */
+const NAME_CONCURRENCY = 6;
 
 export class HttpError extends Error {
   constructor(
@@ -57,6 +60,9 @@ export class WowheadClient {
   private tokens: TokenSource;
   private areas: AreaNames;
   private doFetch: typeof fetch;
+  /** `${typeId}:${id}` -> display name. Static game data, so cached for the process lifetime. */
+  private names = new Map<string, string | null>();
+  private nameInFlight = new Map<string, Promise<string | undefined>>();
 
   constructor(
     private readonly env: Env,
@@ -94,6 +100,7 @@ export class WowheadClient {
       `${env.WOWHEAD_TOOLTIP_URL}/${env.WOWHEAD_ENV}/data/global`,
       env.HTTP_TIMEOUT_MS,
       REAL_UA,
+      this.doFetch,
     );
   }
 
@@ -225,6 +232,55 @@ export class WowheadClient {
    */
   async areaNames(): Promise<Map<number, string>> {
     return this.areas.load();
+  }
+
+  /** Area, skill, NPC-classification and currency name tables (one request, cached). */
+  async globalNames(): Promise<GlobalNames> {
+    return this.areas.loadAll();
+  }
+
+  /** Remember names a page already supplied, so later lookups need no request. */
+  rememberNames(names: Record<string, string> | undefined): void {
+    if (!names) return;
+    for (const [k, v] of Object.entries(names)) if (v && !this.names.get(k)) this.names.set(k, v);
+  }
+
+  /**
+   * Name one entity by Wowhead type id + id: the in-process name cache first,
+   * then the (un-challenged) tooltip endpoint. Undefined when Wowhead has no name.
+   */
+  async entityName(typeId: number, id: number): Promise<string | undefined> {
+    const key = `${typeId}:${id}`;
+    const cached = this.names.get(key);
+    if (cached !== undefined) return cached ?? undefined;
+    const pending = this.nameInFlight.get(key);
+    if (pending) return pending;
+    const t = typeById(typeId);
+    if (!t) return undefined;
+    const p = this.tooltip(t, id)
+      .then((tip) => {
+        const name = tip?.name?.trim() || undefined;
+        this.names.set(key, name ?? null);
+        return name;
+      })
+      .catch(() => undefined)
+      .finally(() => this.nameInFlight.delete(key));
+    this.nameInFlight.set(key, p);
+    return p;
+  }
+
+  /** Name many `[typeId, id]` refs with bounded concurrency. Returns `${typeId}:${id}` -> name. */
+  async entityNames(refs: Array<[number, number]>): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const queue = [...new Map(refs.map((r) => [`${r[0]}:${r[1]}`, r] as const)).values()];
+    const worker = async () => {
+      for (let r = queue.shift(); r; r = queue.shift()) {
+        const name = await this.entityName(r[0], r[1]);
+        if (name) out.set(`${r[0]}:${r[1]}`, name);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(NAME_CONCURRENCY, queue.length) }, worker));
+    return out;
   }
 
   // ── Search ──

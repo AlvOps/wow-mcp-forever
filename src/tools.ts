@@ -1,7 +1,18 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { HttpError, type WowheadClient } from './wowhead/client.js';
-import { type PageInfo, summarizeRow } from './wowhead/parse.js';
+import { type PageInfo, type SearchResult, summarizeRow } from './wowhead/parse.js';
+import {
+  DESCRIPTION_GUIDANCE,
+  finish,
+  presentMatch,
+  presentRow,
+  resolveFacts,
+  resolveText,
+  rowRefs,
+  tableTitle,
+  textRefs,
+} from './present.js';
 import { ENTITY_TYPE_NAMES, type EntityType, typeByName } from './wowhead/types.js';
 import { logger } from './util/logger.js';
 
@@ -10,7 +21,8 @@ const typeSchema = z
   .describe('What kind of thing: item, quest, npc, spell, object, zone, faction, itemset, achievement, ...');
 
 function ok(data: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  // Compact JSON: indentation roughly doubled the payload the model must read.
+  return { content: [{ type: 'text' as const, text: JSON.stringify(data) }] };
 }
 
 function fail(message: string) {
@@ -39,10 +51,12 @@ function resolveType(name: string): EntityType {
 
 /**
  * Tables that only ever dilute an answer: transmog/outfit noise, comment and
- * media stubs. They stay visible in `availableTables` and are returned when
- * explicitly asked for through `sections`.
+ * media stubs, and lists that rarely answer a player's question (shared
+ * cooldowns, achievement criteria, see-also). They stay visible in
+ * `availableTables` and are returned when explicitly asked for through `sections`.
  */
-const NOISE_TABLES = /^(outfits|transmog|comments|screenshots|videos|guides|see-also|same-model-as|related|external)/;
+const NOISE_TABLES =
+  /^(outfits|transmog|comments|screenshots|videos|guides|see-also|same-model-as|related|external|shared-cooldown|criteria-of)/;
 
 /** Tables whose rows carry a `dropChance` and should be ordered by it. */
 const DROP_TABLES = /^(dropped-by|pick-pocketed-from|skinned-from|mined-from-|contained-in-|salvaged-from|prospected-from|disenchanted-from|reward-from|drops)/;
@@ -64,11 +78,13 @@ function orderByDropChance(rows: Record<string, unknown>[], minSamples: number):
 }
 
 /**
- * Shape a parsed page for the model: compact rows, capped per table.
+ * Shape a parsed page for the model: user-facing rows, capped per table.
  *
- * Three deliberate transformations, all disclosed in `note`:
- * - `location` ids are joined by Wowhead-sourced `locations` names, because a
- *   model handed bare ids invents the zone names;
+ * - every id a row or text references (reagents, quest rewards, created
+ *   items, `[npc=…]` markup) is resolved to a Wowhead-sourced name — first
+ *   from the page's own embedded name data, then from the tooltip service;
+ * - numeric `location` ids become one `zone` string of Wowhead area names;
+ * - internal fields (react, classification, type, skill, colors, …) are dropped;
  * - drop tables are ordered by drop chance (well-sampled rows first) BEFORE the
  *   row cap, so the best sources survive truncation;
  * - noise tables are omitted unless requested.
@@ -94,52 +110,48 @@ export async function shapePage(
       let rows = lv.rows.map((r) => summarizeRow(r, lv.template));
       const sorted = DROP_TABLES.test(lv.id.toLowerCase()) && rows.some((r) => r['dropChance'] !== undefined);
       if (sorted) rows = orderByDropChance(rows, minSamples);
-      return { lv, rows, sorted };
+      // Cap before naming, so only rows that are actually returned cost a lookup.
+      return { lv, rows: rows.slice(0, opts.maxRows), sorted };
     });
 
-  const ids = new Set<number>();
-  for (const { rows } of prepared) {
-    for (const row of rows) {
-      const loc = row['location'];
-      if (Array.isArray(loc)) for (const id of loc) if (typeof id === 'number') ids.add(id);
-    }
-  }
+  // Name every id-bearing reference: the page's own name data first, then tooltips.
+  client.rememberNames(info.names);
+  const names = new Map<string, string>(Object.entries(info.names ?? {}));
+  const refs = [
+    ...prepared.flatMap(({ rows }) => rows.flatMap(rowRefs)),
+    ...textRefs(info.quickFacts),
+    ...textRefs(info.text),
+  ].filter(([t, id]) => !names.has(`${t}:${id}`));
+  if (refs.length > 0) for (const [k, v] of await client.entityNames(refs)) names.set(k, v);
 
-  if (ids.size > 0) {
-    const names = await client.areaNames();
-    if (names.size > 0) {
-      for (const { rows } of prepared) {
-        for (const row of rows) {
-          const loc = row['location'];
-          if (!Array.isArray(loc)) continue;
-          const resolved = loc.map((id) => (typeof id === 'number' ? names.get(id) : undefined)).filter(Boolean);
-          if (resolved.length > 0) row['locations'] = resolved;
-        }
-      }
-    }
-  }
+  const globals = await client.globalNames();
+  const ctx = { globals, names, pageUrl: (path: string, id: number) => client.pageUrl(path, id) };
 
   const tables = prepared.map(({ lv, rows, sorted }) => ({
     table: lv.id,
+    title: tableTitle(lv.id),
     rowsOnPage: lv.rows.length,
     ...(sorted ? { sortedBy: `dropChance desc, rows below ${minSamples} samples last` } : {}),
-    rows: rows.slice(0, opts.maxRows),
+    rows: rows.map((r) => presentRow(r, lv.template, ctx)),
   }));
 
-  return {
-    url,
-    title: info.title,
-    description: info.description,
-    quickFacts: info.quickFacts,
-    text: info.text,
-    note:
-      '`locations` are area names taken from Wowhead, alongside the raw numeric `location` ids. ' +
-      `Drop tables report \`dropChance\` with the \`samples\` it is based on, and are ordered by drop chance with rows below ${minSamples} samples last. ` +
-      'Transmog/comment/media tables are omitted; see `availableTables` and pass `sections` to get one.',
-    tables,
-    availableTables: info.listviews.map((lv) => `${lv.id} (${lv.rows.length})`),
-    source: sourceOf(url),
-  };
+  const quickFacts = resolveFacts(info.quickFacts, names);
+  const text = resolveText(info.text, names);
+  return finish(
+    {
+      url,
+      title: info.title,
+      ...(info.description ? { description: info.description } : {}),
+      ...(quickFacts ? { quickFacts } : {}),
+      ...(text ? { text } : {}),
+      note:
+        '`dropChance` comes with `samples` (how many kills/loots it is based on); drop tables list well-sampled rows first. ' +
+        'Pass a table id from `availableTables` in `sections` to get more of it.',
+      tables,
+      availableTables: info.listviews.map((lv) => `${lv.id} (${lv.rows.length})`),
+    },
+    sourceOf(url),
+  );
 }
 
 /** Where the answer came from — always the last field, so it is easy to cite. */
@@ -147,8 +159,37 @@ function sourceOf(url: string, label = 'Wowhead: WoW Forever') {
   return { label, url };
 }
 
+/** Item fields from the item XML, reshaped for a player (names, no raw stat keys). */
+async function presentItem(item: Record<string, unknown>, client: WowheadClient) {
+  const out: Record<string, unknown> = {};
+  for (const k of ['itemLevel', 'quality', 'class', 'subclass', 'slot', 'tooltip']) {
+    if (item[k] !== undefined && item[k] !== '') out[k] = item[k];
+  }
+  const spell = item['createdBySpell'] as { id?: number; name?: string } | undefined;
+  if (spell?.name) {
+    out['createdBy'] = {
+      name: spell.name,
+      ...(spell.id ? { url: client.pageUrl('spell', spell.id) } : {}),
+    };
+  }
+  const reagents = item['reagents'] as { id: number; name?: string; count: number }[] | undefined;
+  if (reagents?.length) {
+    const missing = reagents.filter((r) => !r.name).map((r) => [3, r.id] as [number, number]);
+    const named = missing.length ? await client.entityNames(missing) : new Map<string, string>();
+    const parts = reagents.map((r) => {
+      const name = r.name || named.get(`3:${r.id}`);
+      return name ? `${r.count || 1}x ${name}` : undefined;
+    });
+    out['reagents'] = parts.every(Boolean) ? parts.join(', ') : 'Not available from Wowhead; see the linked page.';
+  }
+  return out;
+}
+
 /** Types preferred when a bare name matches several entities. */
 const PREFERRED_TYPES = ['item', 'npc', 'quest', 'object', 'zone', 'spell'];
+
+/** forever_find rows per table: enough to answer, small enough not to drown the answer. */
+const FIND_DEFAULT_ROWS = 5;
 
 export function registerTools(server: McpServer, client: WowheadClient): void {
   // ── Search ──────────────────────────────────────────
@@ -157,7 +198,8 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'Search WoW: Forever',
       description:
-        'Search the Wowhead World of Warcraft: Forever database by name. Returns matching items, quests, NPCs, spells, zones, etc. with their ids and Wowhead links. Use the ids with forever_lookup or forever_details.',
+        'Search the Wowhead World of Warcraft: Forever database by name. Returns matching items, quests, NPCs, spells, zones, etc. with their Wowhead links; the `id` is only for calling forever_lookup or forever_details.' +
+        DESCRIPTION_GUIDANCE,
       inputSchema: {
         query: z.string().min(2).describe('Name or partial name, e.g. "Defender of Dalaran" or "Hogger"'),
         type: typeSchema.optional().describe('Only return this kind of result'),
@@ -167,15 +209,11 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     async ({ query, type, limit }) => {
       try {
         const results = await client.search(query, { type: type ? resolveType(type) : undefined, limit });
+        const source = sourceOf(client.searchUrl(query), 'Wowhead: WoW Forever search');
         if (results.length === 0) {
-          return ok({
-            query,
-            results: [],
-            note: 'No matches on Wowhead Forever.',
-            source: sourceOf(client.searchUrl(query), 'Wowhead: WoW Forever search'),
-          });
+          return ok(finish({ query, results: [], note: 'No matches on Wowhead Forever.' }, source));
         }
-        return ok({ query, results, source: sourceOf(client.searchUrl(query), 'Wowhead: WoW Forever search') });
+        return ok(finish({ query, results: results.map(presentMatch) }, source));
       } catch (err) {
         logger.error({ err }, 'forever_search failed');
         return fail(describeError(err));
@@ -189,7 +227,8 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'WoW: Forever quick lookup',
       description:
-        'Get the tooltip summary for one WoW: Forever entity by type and id: name, quality, stats, level, requirements, effects. For items it also returns slot, item level and crafting reagents.',
+        'Get the tooltip summary for one WoW: Forever entity by type and id: name, quality, stats, level, requirements, effects. For items it also returns slot, item level and crafting reagents (by name).' +
+        DESCRIPTION_GUIDANCE,
       inputSchema: {
         type: typeSchema,
         id: z.number().int().positive().describe('Wowhead id from forever_search'),
@@ -202,19 +241,29 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
           client.tooltip(t, id),
           t.name === 'item' ? client.itemXml(id) : Promise.resolve(undefined),
         ]);
+        const url = client.pageUrl(t.path, id);
         if (!tooltip && !item) {
           // Fall back to the full page so the model still gets something useful.
           const page = await client.page(t, id);
-          return ok(await shapePage(page, client.pageUrl(t.path, id), { maxRows: 10 }, client));
+          return ok(await shapePage(page, url, { maxRows: 10 }, client));
         }
-        return ok({
-          type: t.name,
-          id,
-          url: client.pageUrl(t.path, id),
-          ...tooltip,
-          ...(item ? { item } : {}),
-          source: sourceOf(client.pageUrl(t.path, id)),
-        });
+        const name = tooltip?.name ?? (typeof item?.['name'] === 'string' ? item['name'] : undefined);
+        const shownItem = item ? await presentItem(item, client) : undefined;
+        // The item card repeats the tooltip text; send it once.
+        if (shownItem && tooltip?.text && shownItem['tooltip'] === tooltip.text) delete shownItem['tooltip'];
+        return ok(
+          finish(
+            {
+              ...(name ? { name } : {}),
+              type: t.name,
+              ...(tooltip?.quality ? { quality: tooltip.quality } : {}),
+              url,
+              ...(tooltip?.text ? { tooltip: tooltip.text } : {}),
+              ...(shownItem ? { item: shownItem } : {}),
+            },
+            sourceOf(url),
+          ),
+        );
       } catch (err) {
         logger.error({ err }, 'forever_lookup failed');
         return fail(describeError(err));
@@ -228,7 +277,8 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'WoW: Forever full details',
       description:
-        'Read the full Wowhead Forever page for an entity: quick facts, description/objectives, and data tables such as dropped-by (with drop chance and sample size), sold-by, starts/ends quest, objective-of, reward-from, created-by, reagent-for, teaches, quests in a zone. Rows carry numeric `location` ids plus `locations` area names, and drop tables are ordered by drop chance. Use `sections` to restrict — or to reach a table that is hidden by default (transmog, comments, media).',
+        'Read the full Wowhead Forever page for an entity: quick facts, description/objectives, and data tables such as dropped-by (with drop chance and sample size), sold-by, starts/ends quest, objective-of, reward-from, created-by (reagents by name), reagent-for, teaches, quests in a zone. Rows carry a `zone` name, a level range and a Wowhead `url`; drop tables are ordered by drop chance. Use `sections` to restrict — or to reach a table that is hidden by default (transmog, comments, media, shared cooldowns).' +
+        DESCRIPTION_GUIDANCE,
       inputSchema: {
         type: typeSchema,
         id: z.number().int().positive().describe('Wowhead id from forever_search'),
@@ -257,39 +307,51 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'Find in WoW: Forever',
       description:
-        'One-step answer for questions like "where does X drop", "who sells X", "how do I start quest X": searches WoW: Forever by name, then returns full details of the best match plus the other candidates. Rows carry numeric `location` ids plus `locations` area names; drop tables are ordered by drop chance and report sample sizes, so low-sample flukes are not presented as solid rates.',
+        'One-step answer for questions like "where does X drop", "who sells X", "how do I start quest X": searches WoW: Forever by name, then returns details of the best match plus the other candidates. Rows carry a `zone` name, a level range and a Wowhead `url`; drop tables are ordered by drop chance and report sample sizes, so low-sample flukes are not presented as solid rates. Returns the top rows per table; use forever_details with `sections` for more of one table.' +
+        DESCRIPTION_GUIDANCE,
       inputSchema: {
         name: z.string().min(2).describe('Name of the item, quest, NPC, zone, ...'),
         type: typeSchema.optional().describe('Restrict to this kind of thing (recommended)'),
-        maxRows: z.number().int().min(1).max(200).optional().describe('Max rows per table (default 15)'),
+        sections: z
+          .array(z.string())
+          .optional()
+          .describe('Only include tables whose id contains one of these, e.g. ["dropped-by","sold-by"]'),
+        maxRows: z.number().int().min(1).max(200).optional().describe(`Max rows per table (default ${FIND_DEFAULT_ROWS})`),
       },
     },
-    async ({ name, type, maxRows }) => {
+    async ({ name, type, sections, maxRows }) => {
       try {
         const results = await client.search(name, { type: type ? resolveType(type) : undefined, limit: 8 });
         if (results.length === 0) {
-          return ok({
-            query: name,
-            note: 'No matches on Wowhead Forever.',
-            source: sourceOf(client.searchUrl(name), 'Wowhead: WoW Forever search'),
-          });
+          return ok(
+            finish(
+              { query: name, note: 'No matches on Wowhead Forever.' },
+              sourceOf(client.searchUrl(name), 'Wowhead: WoW Forever search'),
+            ),
+          );
         }
         // A bare name can match several entity types (an item and a spell called
         // the same thing). Prefer the kinds a player is usually asking about, and
         // say plainly when the name was ambiguous.
         const exactMatches = results.filter((r) => r.name.toLowerCase() === name.toLowerCase());
-        const best =
+        const best: SearchResult =
           exactMatches.find((r) => PREFERRED_TYPES.includes(r.type)) ?? exactMatches[0] ?? results[0]!;
         const collisions = exactMatches.filter((r) => r !== best);
+        const others = results.filter((r) => r !== best && !collisions.includes(r));
         const t = resolveType(best.type);
         const page = await client.page(t, best.id);
+        // shapePage ends with `answerGuidance` then `source`, so the link to
+        // where the answer came from is always the last thing in the reply.
         return ok({
-          match: { type: best.type, id: best.id, name: best.name },
-          ...(collisions.length > 0 ? { nameCollisions: collisions } : {}),
-          otherMatches: results.filter((r) => r !== best),
-          // shapePage ends with `source`, so it stays the final field — the link
-          // to where the answer came from is always the last thing in the reply.
-          ...(await shapePage(page, best.url, { maxRows: maxRows ?? 15 }, client)),
+          match: presentMatch(best),
+          ...(collisions.length > 0
+            ? {
+                nameCollisions: collisions.map(presentMatch),
+                nameCollisionNote: 'Other entries with the same name; tell them apart by quality and link, not by id.',
+              }
+            : {}),
+          ...(others.length > 0 ? { otherMatches: others.map(presentMatch) } : {}),
+          ...(await shapePage(page, best.url, { sections, maxRows: maxRows ?? FIND_DEFAULT_ROWS }, client)),
         });
       } catch (err) {
         logger.error({ err }, 'forever_find failed');

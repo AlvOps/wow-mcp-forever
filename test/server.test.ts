@@ -81,8 +81,39 @@ test('forever_details with section filter', async () => {
 
 test('forever_find picks exact match', async () => {
   const r = body(await client.callTool({ name: 'forever_find', arguments: { name: 'Defender of Dalaran' } }));
-  assert.deepEqual(r['match'], { type: 'item', id: 279841, name: 'Defender of Dalaran' });
+  const m = r['match'] as Record<string, unknown>;
+  assert.deepEqual([m['type'], m['id'], m['name']], ['item', 279841, 'Defender of Dalaran']);
+  assert.match(String(m['url']), /\/forever\/item=279841$/, 'the id always travels with a link');
   assert.ok((r['tables'] as unknown[]).length === 2);
+});
+
+test('every tool response ends with answerGuidance then source', async () => {
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['forever_search', { query: 'defender' }],
+    ['forever_lookup', { type: 'item', id: 279841 }],
+    ['forever_details', { type: 'item', id: 279841 }],
+    ['forever_find', { name: 'Defender of Dalaran' }],
+  ];
+  for (const [name, args] of calls) {
+    const r = body(await client.callTool({ name, arguments: args }));
+    const keys = Object.keys(r);
+    assert.equal(keys.at(-1), 'source', `${name}: source must be last`);
+    assert.equal(keys.at(-2), 'answerGuidance', `${name}: answerGuidance precedes source`);
+    assert.match(String(r['answerGuidance']), /Never show numeric ids/);
+  }
+});
+
+test('forever_lookup returns no raw item json or icon ids', async () => {
+  const r = body(await client.callTool({ name: 'forever_lookup', arguments: { type: 'item', id: 279841 } }));
+  const item = r['item'] as Record<string, unknown>;
+  assert.equal(item['data'], undefined);
+  assert.equal(item['equip'], undefined);
+  assert.equal(r['icon'], undefined);
+});
+
+test('every tool description carries the presentation contract', async () => {
+  const { tools } = await client.listTools();
+  for (const t of tools) assert.match(String(t.description), /never show numeric ids/i, t.name);
 });
 
 test('404 becomes a readable error', async () => {

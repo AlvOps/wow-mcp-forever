@@ -40,24 +40,62 @@ export function htmlToText(html: string): string {
   let s = html
     .replace(/<!--[\s\S]*?-->/g, '')
     .replace(/<(script|style|noscript)[^>]*>[\s\S]*?<\/\1>/gi, '')
+    // Raw newlines in HTML source are just whitespace; only tags break lines.
+    .replace(/\s+/g, ' ')
+    // Money is rendered with coin icons; keep the unit as text.
+    .replace(/<span[^>]+class=["'][^"']*\bmoney(gold|silver|copper)\b[^"']*["'][^>]*>\s*([\d,]+)\s*<\/span>/gi,
+      (_m, unit: string, n: string) => `${n}${unit[0]!.toLowerCase()}`)
+    .replace(/<(h[1-6]|p|div|tr|table|ul|ol)(\s[^>]*)?>/gi, '\n$&')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(p|div|tr|li|h[1-6]|table|ul|ol)>/gi, '\n')
     .replace(/<li[^>]*>/gi, '- ')
     .replace(/<\/t[dh]>/gi, '  ')
     .replace(/<[^>]+>/g, '');
-  s = decodeEntities(s);
+  s = decodeEntities(s).replace(/\u00a0/g, ' ').replace(/ +([,.;)])/g, '$1');
   return tidy(s);
 }
 
+/** Wowhead markup entity tag names -> Wowhead type ids (see types.ts). */
+const MARKUP_TYPE_IDS: Record<string, number> = {
+  npc: 1, object: 2, item: 3, 'item-set': 4, itemset: 4, quest: 5, spell: 6, zone: 7,
+  faction: 8, achievement: 10, title: 11, event: 12, skill: 15, currency: 17,
+};
+
+/** Resolves a `[npc=123]`-style reference to a display name, if known. */
+export type RefResolver = (typeId: number, id: number) => string | undefined;
+
+/**
+ * Marker left in text for a reference whose name was not on the page; the
+ * tool layer resolves it (or removes it) before anything reaches the model.
+ */
+export const REF_MARK = /\u27e6(\d+):(-?\d+)\u27e7/g;
+
 /** Convert Wowhead's BBCode-like markup ([ul][li]...[/li][/ul]) into plain text. */
-export function markupToText(markup: string): string {
+export function markupToText(markup: string, resolve?: RefResolver): string {
   let s = markup
-    .replace(/\[li\]/gi, '\n- ')
+    // Hidden tooltip bodies: the visible text is the [span tooltip=...] that follows.
+    .replace(/\[tooltip\s+name=[^\]]*\][\s\S]*?\[\/tooltip\]/gi, '')
+    .replace(/\[icondb=[^\]]*\]/gi, '')
+    // NPC reaction is shown as coloured A/H letters (q2 friendly, q neutral, q10 hostile).
+    .replace(/((?:\[color=q\d*\][AH]\[\/color\]\s*)+)/gi, (run: string) =>
+      [...run.matchAll(/\[color=(q\d*)\]([AH])\[\/color\]/gi)]
+        .map(([, q, side]) => {
+          const attitude = q === 'q2' ? 'friendly' : q === 'q10' ? 'hostile' : 'neutral';
+          return `${side!.toUpperCase() === 'A' ? 'Alliance' : 'Horde'} ${attitude}`;
+        })
+        .join(', '))
+    .replace(/\[li(\s[^\]]*)?\]/gi, '\n- ')
+    .replace(/\[\/li\]/gi, '\n')
     .replace(/\[\/?(ul|ol)\]/gi, '\n')
     .replace(/\[br\]/gi, '\n')
     .replace(/\[(npc|item|quest|spell|zone|object|achievement|faction|currency|item-set|itemset|title|skill|event)=(-?\d+)[^\]]*\]/gi,
-      (_m, t: string, id: string) => `${t} #${id}`)
-    .replace(/\[money=(\d+)\]/gi, (_m, c: string) => formatMoney(Number(c)))
+      (_m, t: string, id: string) => {
+        if (!resolve) return `${t} #${id}`;
+        const typeId = MARKUP_TYPE_IDS[t.toLowerCase()]!;
+        return resolve(typeId, Number(id)) ?? `\u27e6${typeId}:${id}\u27e7`;
+      })
+    .replace(/\[money=(\d+)(?:-(\d+))?\]/gi, (_m, a: string, b?: string) =>
+      b && b !== a ? `${formatMoney(Number(a))} to ${formatMoney(Number(b))}` : formatMoney(Number(a)))
     .replace(/\[\/?[a-z-]+(=[^\]]*)?(\s[^\]]*)?\]/gi, '');
   s = decodeEntities(s);
   return tidy(s);
@@ -80,6 +118,45 @@ export function cleanTitle(raw: string): string {
     .replace(/\s*-\s*(Wowhead|World of Warcraft).*$/i, '')
     .replace(/\s*-\s*[^-]+?\s*-\s*Forever\s*$/i, '')
     .trim();
+}
+
+/**
+ * Quick Facts as clean "- Label: value" lines: no glued items, no label
+ * without a value ("Icon:"), no empty parenthetical ("Cost: (each)").
+ */
+export function cleanFacts(text: string): string | undefined {
+  const lines: string[] = [];
+  for (const raw of text.split('\n')) {
+    let line = raw.replace(/^\s*-\s*/, '').replace(/\(\s*\)/g, '').replace(/\s+/g, ' ').trim();
+    line = line.replace(/^Added in patch\s+(?!:)/i, 'Added in patch: ').replace(/^React:/i, 'Reaction:');
+    if (!line) continue;
+    const m = /^([^:]{1,40}):\s*(.*)$/.exec(line);
+    if (m) {
+      const value = m[2]!.trim();
+      // A value that is empty, or only a qualifier such as "(each)", has lost its content.
+      if (!value || /^\([^)]*\)$/.test(value)) continue;
+      line = `${m[1]!.trim()}: ${m[2]!.trim()}`;
+    }
+    if (!lines.includes(`- ${line}`)) lines.push(`- ${line}`);
+  }
+  return lines.length ? lines.join('\n') : undefined;
+}
+
+/** Page chrome that is never content: buttons, infobox headings, media stubs. */
+const CHROME_LINES = /^(View in 3D|Find upgrades\.*|Links|Quick Facts|Screenshots|Videos|Comments|Related|Contribute|Share|Report|Show|Hide|Copy|Edit)$/i;
+
+/** Strip page chrome lines from body text; drop a leading repeat of the title. */
+export function cleanBodyText(text: string, title?: string): string | undefined {
+  const bare = title?.replace(/\s*-\s*[^-]+$/, '').trim().toLowerCase();
+  const out: string[] = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (CHROME_LINES.test(line) || /^-\s*$/.test(line)) continue;
+    if (bare && out.every((l) => !l) && (line.toLowerCase() === bare || line.toLowerCase() === title?.toLowerCase())) continue;
+    out.push(line);
+  }
+  const s = tidy(out.join('\n'));
+  return s || undefined;
 }
 
 // ── Balanced extraction for embedded JS literals ───────
@@ -311,6 +388,7 @@ const KEEP_FIELDS = [
   'slot', 'side', 'react', 'type', 'category', 'stack', 'cost', 'count', 'outof',
   'percent', 'skill', 'learnedat', 'colors', 'nreagents', 'reagents', 'location',
   'tag', 'boss', 'classification', 'rank', 'itemrewards', 'xp', 'money', 'avail',
+  'quality', 'creates', 'stock', 'itemchoices',
 ] as const;
 
 /** Reduce a raw listview row to compact, readable fields. */
@@ -320,6 +398,8 @@ export function summarizeRow(row: Record<string, unknown>, template?: string): R
     if (row[k] !== undefined && row[k] !== null && row[k] !== '') out[k] = row[k];
   }
   // Item names in listviews are prefixed with a quality digit, e.g. "4Thunderfury".
+  if (typeof out['quality'] === 'number') out['quality'] = QUALITY_NAMES[out['quality']] ?? undefined;
+  if (out['quality'] === undefined) delete out['quality'];
   if (typeof out['name'] === 'string') {
     let name = out['name'];
     const qm = /^(\d)(\D.*)$/.exec(name);
@@ -340,6 +420,14 @@ export function summarizeRow(row: Record<string, unknown>, template?: string): R
   if (typeof out['cost'] === 'object' && Array.isArray(out['cost']) && typeof out['cost'][0] === 'number') {
     out['cost'] = formatMoney(out['cost'][0] as number);
   }
+  // Vendor rows: cost is [[copper, currencies?, items?]].
+  if (Array.isArray(out['cost']) && Array.isArray(out['cost'][0]) && typeof out['cost'][0][0] === 'number') {
+    const [copper, currencies, items] = out['cost'][0] as [number, unknown?, unknown?];
+    out['cost'] = copper > 0 ? formatMoney(copper) : undefined;
+    if (Array.isArray(currencies) && currencies.length) out['costCurrencies'] = currencies;
+    if (Array.isArray(items) && items.length) out['costItems'] = items;
+    if (out['cost'] === undefined) delete out['cost'];
+  }
   if (out['side'] !== undefined) {
     out['side'] = { 1: 'Alliance', 2: 'Horde', 3: 'Both' }[out['side'] as number] ?? out['side'];
   }
@@ -354,6 +442,32 @@ export interface PageInfo {
   quickFacts?: string;
   text?: string;
   listviews: Listview[];
+  /** Names of every entity the page references, keyed `${typeId}:${id}` (WH.Gatherer data). */
+  names?: Record<string, string>;
+}
+
+/**
+ * Wowhead embeds the name of every entity a page references — reagents, quest
+ * rewards, spells — as `WH.Gatherer.addData(typeId, env, {id: {name_enus,...}})`.
+ * This is the bulk name source for ids in listview rows: no extra requests.
+ */
+export function parseGatherer(html: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const re = /Gatherer\.addData\(\s*(\d+)\s*,\s*\d+\s*,\s*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) {
+    const typeId = Number(m[1]);
+    const objText = extractBalanced(html, m.index + m[0].length);
+    const parsed = objText ? lenientJson(objText) : undefined;
+    if (!parsed || typeof parsed !== 'object') continue;
+    for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!v || typeof v !== 'object') continue;
+      const rec = v as Record<string, unknown>;
+      const name = rec['name_enus'] ?? rec['name'];
+      if (typeof name === 'string' && name && typeId !== 29) out[`${typeId}:${id}`] = decodeEntities(name);
+    }
+  }
+  return out;
 }
 
 function metaContent(html: string, attr: string, value: string): string | undefined {
@@ -369,11 +483,14 @@ export function parsePage(html: string): PageInfo {
   const description = metaContent(html, 'name', 'description') ?? metaContent(html, 'property', 'og:description');
 
   // Quick Facts infobox: WH.markup.printHtml("[ul][li]...", "infobox-contents-0")
+  const names = parseGatherer(html);
+  const resolve: RefResolver = (typeId, id) => names[`${typeId}:${id}`];
+
   let quickFacts: string | undefined;
   const qf = /(?:WH\.)?[Mm]arkup\.printHtml\(\s*("(?:[^"\\]|\\.)*")\s*,\s*["']infobox/.exec(html);
   if (qf) {
     try {
-      quickFacts = markupToText(JSON.parse(qf[1]!) as string);
+      quickFacts = cleanFacts(markupToText(JSON.parse(qf[1]!) as string, resolve));
     } catch {
       /* ignore */
     }
@@ -383,12 +500,29 @@ export function parsePage(html: string): PageInfo {
   let text: string | undefined;
   const start = html.search(/<div[^>]+class=["'][^"']*\btext\b[^"']*["'][^>]*>/i);
   if (start >= 0) {
-    const body = html.slice(start, start + 60_000);
-    const end = body.search(/<(div[^>]+id=["'](tabs|lv-|comments|ad-)|h2[^>]*>\s*(Comments|Related|Screenshots))/i);
-    text = htmlToText(end > 0 ? body.slice(0, end) : body).slice(0, 6000) || undefined;
+    let body = html.slice(start, start + 60_000);
+    const end = body.search(/<(div[^>]+id=["'](tabs|lv-|comments|ad-)|h2[^>]*>\s*(Comments|Related|Screenshots|Guides))/i);
+    if (end > 0) body = body.slice(0, end);
+    body = body
+      // Action buttons ("View in 3D", "Find upgrades...", "Links").
+      .replace(/<div[^>]+class=["'][^"']*db-action-buttons[^"']*["'][^>]*>[\s\S]*?<\/div>/gi, '')
+      // Infobox headings ("Quick Facts", "Screenshots", "Videos"); the facts themselves come from markup.
+      .replace(/<tr[^>]+class=["'][^"']*infobox-heading[^"']*["'][^>]*>[\s\S]*?<\/tr>/gi, '')
+      // The page heading repeats the title.
+      .replace(/<h1[^>]*>[\s\S]*?<\/h1>/gi, '')
+      // "See if you've already completed this by typing: /run print(...(166))" — a macro, not content.
+      .replace(/See if you've already completed this[^<]*(<br\s*\/?>\s*)?<pre[\s\S]*?<\/pre>/gi, '');
+    text = cleanBodyText(htmlToText(body), title)?.slice(0, 6000);
   }
 
-  return { title, description, quickFacts, text, listviews: parseListviews(html) };
+  return {
+    title,
+    description,
+    quickFacts,
+    text,
+    listviews: parseListviews(html),
+    ...(Object.keys(names).length ? { names } : {}),
+  };
 }
 
 // ── Tooltip JSON ───────────────────────────────────────
