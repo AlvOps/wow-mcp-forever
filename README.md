@@ -1,148 +1,80 @@
-# wow-mcp
+# wow-forever-mcp
 
-MCP server that wraps the **complete World of Warcraft retail API** (Game Data + Profile) as 197 MCP tools. Supports **OAuth 2.1 authentication** (authorization code + PKCE for ChatGPT, client credentials for CLI tools) and is fully **region-agnostic** — every tool accepts `region` and `locale` as optional parameters, so a single server instance can query any region.
+An MCP server that lets an AI assistant answer questions about **World of Warcraft: Forever** using the [Wowhead Forever database](https://www.wowhead.com/forever).
 
-![screenshot](screenshot.png "Screenshot")
+Forked from [brunofin/wow-mcp](https://github.com/brunofin/wow-mcp). The retail Blizzard API tools, OAuth and Postgres were removed. No API keys are needed.
 
+## Tools
 
-## Quick start
+| Tool | What it answers |
+|------|-----------------|
+| `forever_find` | One step: "where does X drop?", "who sells X?", "how do I start quest X?" Searches by name and returns full details of the best match. |
+| `forever_search` | Find items, quests, NPCs, spells, zones… by name, returning their ids. |
+| `forever_lookup` | Tooltip summary for one entity: stats, level, requirements, effects. Items also get slot, item level and crafting reagents. |
+| `forever_details` | Full page data: quick facts, description/objectives, and tables like `dropped-by` (with drop chance), `sold-by`, `starts`, `objective-of`, `reward-from`, `created-by`, `reagent-for`. |
+
+Types: `item`, `quest`, `npc`, `spell`, `object`, `zone`, `faction`, `itemset`, `achievement`, `title`, `event`, `class`, `race`, `skill`, `currency`.
+
+## Install
+
+Requires Node.js 20+.
 
 ```bash
-cp .env.example .env
-# Fill in BNET_CLIENT_ID and BNET_CLIENT_SECRET
-
+git clone https://github.com/AlvOps/wow-mcp.git
+cd wow-mcp
 npm install
 npm run build
-npm start          # stdio transport
+npm run selftest            # live check against Wowhead from this machine
 ```
 
-### Development
+`npm run selftest "Hogger"` tests a different search term.
+
+## Connect to Hermes Agent
+
+Hermes launches the server itself over stdio. Add this to `~/.hermes/config.yaml`, adjusting the path:
+
+```yaml
+mcp_servers:
+  wow-forever:
+    command: node
+    args: ["/home/talos/wow-mcp/dist/index.js", "--stdio"]
+```
+
+Restart the gateway (`systemctl --user restart hermes-gateway.service`), then ask something like *"Where does Defender of Dalaran drop in WoW Forever?"*
+
+### HTTP mode instead
 
 ```bash
-npm run dev        # runs via tsx (no build step)
-npm run inspect    # opens MCP Inspector UI
-npm run lint       # type-check only
-npm test           # run auth integration tests
+MCP_AUTH_SECRET=change-me npm run start:http      # serves http://0.0.0.0:3000/mcp
 ```
 
-## API coverage
+```yaml
+mcp_servers:
+  wow-forever:
+    url: "http://localhost:3000/mcp"
+    headers:
+      Authorization: "Bearer change-me"
+```
 
-All 196 retail WoW endpoints are registered as individual MCP tools, plus one custom computed tool:
+Docker: `docker build -t wow-forever-mcp . && docker run -p 3000:3000 -e MCP_AUTH_SECRET=change-me wow-forever-mcp`
 
-- **Game Data API** — 161 tools covering achievements, auctions, azerite essences, connected realms, covenants, creatures, guild crests, heirlooms, items, journals, media, modified crafting, mounts, mythic keystones, mythic raid leaderboards, pets, playable classes, playable races, playable specializations, power types, professions, PvP seasons, PvP tiers, quests, realms, regions, reputations, search endpoints, spells, talents, tech talents, titles, toys, and WoW tokens.
-- **Profile API** — 35 tools for character profiles, achievements, appearance, collections, dungeons, encounters, equipment, hunter pets, media, mythic keystone profile, professions, PvP, quests, reputations, soulbinds, specializations, statistics, titles, and guild endpoints.
-- **Custom** — `wow_character_achievementsTimeline` builds a chronologically sorted timeline of completed achievements (computed, not a raw Blizzard endpoint).
+## Configuration
 
-### Region & locale
+Everything is optional; see [`.env.example`](.env.example).
 
-Every tool accepts two optional parameters:
+## How it works and limits
 
-- `region` — `"us"` (default), `"eu"`, `"kr"`, or `"tw"`
-- `locale` — `"en_US"` (default), or any locale supported by the target region (e.g. `"es_MX"`, `"de_DE"`, `"fr_FR"`, `"ko_KR"`)
+Wowhead has no official API. The server reads the same endpoints Wowhead's own site uses: search suggestions, the tooltip service, item XML and the entity pages, whose data tables it parses. Responses are cached for an hour to keep traffic light.
 
-No region configuration is needed in the environment. The same Battle.net credentials work across all regions.
+- If Wowhead changes its page format, `forever_details` may return fewer tables. `npm run selftest` shows what still works.
+- WoW: Forever is new, so Wowhead's data is still filling in; some drop rates are missing or based on Classic.
+- Use this for personal use, at modest volume, and respect Wowhead's terms.
 
-## Environment variables
-
-See [`.env.example`](.env.example). Only two are required:
-
-- `BNET_CLIENT_ID` — Battle.net OAuth client ID
-- `BNET_CLIENT_SECRET` — Battle.net OAuth client secret
-
-Optional auth (OAuth 2.1 for the MCP HTTP endpoint):
-
-- `MCP_AUTH_SECRET` — passphrase that enables OAuth. Used as the login on the `/authorize` page (for ChatGPT / browser clients), as the `client_secret` for `client_credentials` grants, and directly as a static `Bearer` token for simple clients (Warp, curl, etc.).
-- `MCP_TOKEN_TTL_SECONDS` — access token lifetime (default: `3600`)
-- `DATABASE_URL` — PostgreSQL connection string (e.g. `postgresql://user:pass@host:5432/db`). When set, OAuth tokens, clients, and auth codes are persisted in PostgreSQL so they survive restarts. When absent, in-memory stores are used. The `docker-compose.yml` sets this up automatically.
-
-When `MCP_AUTH_SECRET` is set, the server exposes a full OAuth 2.1 provider:
-
-- `GET /.well-known/oauth-protected-resource` — RFC 9728 metadata
-- `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata (includes `code_challenge_methods_supported: ["S256"]`)
-- `POST /register` — RFC 7591 dynamic client registration
-- `GET|POST /authorize` — authorization code + PKCE flow with passphrase login
-- `POST /token` — supports `authorization_code` (with PKCE) and `client_credentials` grants
-
-The `MCP_AUTH_SECRET` value can also be passed directly as a `Bearer` token (e.g. `Authorization: Bearer <your-secret>`) — useful for clients like Warp that don't support OAuth flows.
-
-If `MCP_AUTH_SECRET` is not set, the server runs without auth.
-
-Optional tuning:
-
-- `LOG_LEVEL` — pino log level (default: `info`)
-- `HTTP_TIMEOUT_MS` — request timeout (default: `15000`)
-- `HTTP_RETRY_LIMIT` — retry count (default: `2`)
-- `CACHE_TTL_SECONDS` — response cache TTL (default: `300`)
-- `CACHE_SIZE` — max cached entries (default: `500`)
-
-## Testing
+## Development
 
 ```bash
-npm test
+npm run dev       # run from source
+npm run inspect   # MCP Inspector UI
+npm test          # parser + end-to-end tests against a fake Wowhead
+npm run lint      # type-check
 ```
-
-Integration tests use Node's built-in test runner (`node:test`) via `tsx` — no extra test dependencies. The suite spins up the server on a random port with test credentials and verifies OAuth 2.1 auth end-to-end:
-
-- Serves `/.well-known/oauth-protected-resource` metadata
-- Serves `/.well-known/oauth-authorization-server` metadata with S256
-- Registers a new client via `POST /register`
-- Rejects `/mcp` without a token (401 with `resource_metadata` hint)
-- Rejects `client_credentials` with wrong secret (401)
-- Issues token via `client_credentials` with correct secret (200)
-- Completes full authorization_code + PKCE flow (register → authorize → token → /mcp)
-- Allows `/mcp` with `MCP_AUTH_SECRET` as a static bearer token (200)
-- Rejects `/mcp` with a bogus token (401)
-
-## Docker
-
-```bash
-docker compose build
-docker compose up -d
-```
-
-Secrets are injected via `.env` on the host (not committed). The container runs as a non-root user with production dependencies only.
-
-The compose stack includes a PostgreSQL instance for persistent OAuth token storage. PostgreSQL data is bind-mounted to `./data/postgres/` on the host (maps to `/var/lib/postgresql/data` inside the container), so it persists across container recreates, host reboots, and Docker engine upgrades. `DATABASE_URL` is pre-configured automatically.
-
-> **NAS / self-hosting note:** make sure the `data/postgres/` directory is on a reliable filesystem. Back up this folder to preserve all OAuth state.
-
-## Architecture
-
-```
-src/
-  index.ts                          # entry point — loads env, starts server
-  app.ts                            # HTTP server factory (all routes)
-  auth.ts                           # OAuth 2.1 provider (metadata, registration, authorize, token, bearer validation)
-  config/
-    env.ts                          # zod env parsing (credentials + tuning)
-    regions.ts                      # region enum, API hosts, OAuth URL
-  store/
-    types.ts                        # OAuthStore interface + record types
-    memory.ts                       # in-memory store (default)
-    postgres.ts                     # PostgreSQL store (when DATABASE_URL set)
-    index.ts                        # factory — picks store based on env
-  mcp/
-    tools.ts                        # auto-registers all endpoints + custom tools
-    schemas.ts                      # shared zod input schemas
-  blizzard/
-    tokenManager.ts                 # OAuth client-credentials + single-flight
-    client.ts                       # got wrapper: bearer injection, cache, 401 retry
-    endpoints/
-      types.ts                      # EndpointDef interface, buildPath(), schema helpers
-      gamedata.ts                   # 161 Game Data API endpoint definitions
-      profileEndpoints.ts           # 35 Profile API endpoint definitions
-    schemas/
-      characterSchemas.ts           # zod response schemas
-      achievementSchemas.ts
-    dto/
-      characterDto.ts               # normalized character DTO
-      timeline.ts                   # achievement timeline builder
-  util/
-    http.ts                         # got defaults
-    cache.ts                        # TTL cache
-    logger.ts                       # pino (stderr)
-test/
-  auth.test.ts                      # OAuth2 auth integration tests
-```
-
-Endpoints are defined declaratively in `gamedata.ts` and `profileEndpoints.ts`. Each entry specifies a tool name, path template, namespace type, and zod input schema. The `tools.ts` module iterates over the registry and auto-registers every entry as an MCP tool, injecting `region` and `locale` parameters automatically.

@@ -1,11 +1,11 @@
 {
-  "name": "mcp-wow-profile",
-  "version": "1.0.0",
-  "description": "MCP server exposing World of Warcraft Profile API tools",
+  "name": "wow-forever-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for World of Warcraft: Forever game data, backed by Wowhead",
   "type": "module",
   "private": true,
   "bin": {
-    "mcp-wow-profile": "./dist/index.js"
+    "wow-forever-mcp": "./dist/index.js"
   },
   "files": [
     "dist"
@@ -15,20 +15,19 @@
     "watch": "tsc --watch",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "inspect": "npx @modelcontextprotocol/inspector dist/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js --stdio",
     "lint": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "tsx --test test/*.test.ts",
+    "start:http": "node dist/index.js --http",
+    "selftest": "node dist/selftest.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.11.0",
-    "got": "^14.4.0",
-    "pg": "^8.20.0",
     "pino": "^9.6.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/pg": "^8.18.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }
