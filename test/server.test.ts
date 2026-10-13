@@ -8,7 +8,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { ITEM_PAGE, ITEM_XML, SUGGESTIONS, TOOLTIP } from './fixtures.js';
+import { ITEM_PAGE, ITEM_XML, SUGGESTIONS, SWORDS_HTML, TOOLTIP } from './fixtures.js';
 
 let fake: Server;
 let client: Client;
@@ -22,6 +22,7 @@ before(async () => {
     if (u.startsWith('/forever/tooltip/item/279841')) return res.end(JSON.stringify(TOOLTIP));
     if (u === '/forever/item=279841&xml') return res.end(ITEM_XML);
     if (u === '/forever/item=279841') return res.end(ITEM_PAGE);
+    if (u === '/forever/items/weapons/one-handed-swords/min-req-level:0/max-req-level:20') return res.end(SWORDS_HTML);
     res.writeHead(404).end();
   });
   await new Promise<void>((r) => fake.listen(0, '127.0.0.1', r));
@@ -56,7 +57,7 @@ function body(r: unknown): Record<string, unknown> {
 
 test('lists only the Forever tools', async () => {
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((t) => t.name).sort(), ['forever_details', 'forever_find', 'forever_lookup', 'forever_search']);
+  assert.deepEqual(tools.map((t) => t.name).sort(), ['forever_browse', 'forever_details', 'forever_find', 'forever_lookup', 'forever_search']);
 });
 
 test('forever_search', async () => {
@@ -93,6 +94,7 @@ test('every tool response ends with answerGuidance then source', async () => {
     ['forever_lookup', { type: 'item', id: 279841 }],
     ['forever_details', { type: 'item', id: 279841 }],
     ['forever_find', { name: 'Defender of Dalaran' }],
+    ['forever_browse', { path: 'items/weapons/one-handed-swords', filters: ['min-req-level:0', 'max-req-level:20'], sort: 'dps desc' }],
   ];
   for (const [name, args] of calls) {
     const r = body(await client.callTool({ name, arguments: args }));
@@ -120,4 +122,23 @@ test('404 becomes a readable error', async () => {
   const r = await client.callTool({ name: 'forever_details', arguments: { type: 'quest', id: 1 } });
   assert.equal(r.isError, true);
   assert.match((r.content as { text: string }[])[0]!.text, /Not found on Wowhead/);
+});
+
+test('forever_browse: one call lists a filtered category sorted by dps', async () => {
+  const r = body(
+    await client.callTool({
+      name: 'forever_browse',
+      arguments: { path: 'items/weapons/one-handed-swords', filters: ['min-req-level:0', 'max-req-level:20'], sort: 'dps desc', limit: 3 },
+    }),
+  );
+  assert.deepEqual(r['filtersApplied'], ['min-req-level:0', 'max-req-level:20']);
+  const rows = r['rows'] as Record<string, unknown>[];
+  assert.deepEqual(rows.map((x) => x['dps']), [20.5, 12.25, 3.1]);
+  assert.match(String((r['source'] as { url: string }).url), /one-handed-swords\/min-req-level:0\/max-req-level:20$/);
+});
+
+test('forever_browse refuses known-dead listing paths with a pointer to the live one', async () => {
+  const r = await client.callTool({ name: 'forever_browse', arguments: { path: 'pet-species' } });
+  assert.equal(r.isError, true);
+  assert.match((r.content as { text: string }[])[0]!.text, /hunter-pets/);
 });

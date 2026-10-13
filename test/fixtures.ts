@@ -40,3 +40,19 @@ export const ITEM_XML = `<?xml version="1.0" encoding="UTF-8"?><wowhead><item id
 <json><![CDATA["id":279841,"name":"Defender of Dalaran","level":42,"reqlevel":37]]></json>
 <jsonEquip><![CDATA["armor":1450,"sta":7]]></jsonEquip>
 </item></wowhead>`;
+
+/** Shape (A) item stats + shape "data: <variable>" rows, as on /forever/items/weapons/one-handed-swords. */
+export const SWORDS_HTML = `<html><head><title>Forever One-Handed Swords</title>
+<link rel="canonical" href="https://www.wowhead.com/forever/items/weapons/one-handed-swords/min-req-level:0/max-req-level:20"></head><body>
+<script>WH.Gatherer.addData(3, 16, {"100":{"name_enus":"Blade {of} Braces","quality":3,"icon":"inv_sword_07","jsonequip":{"appearances":{"0":[19835,""]},"dps":20.5,"speed":2.3,"dmgmin1":30,"dmgmax1":64,"mledps":20.5,"dura":90,"reqlevel":18,"sta":5,"agi":3,"sellprice":9792}},"101":{"name_enus":"Notched Shortsword","quality":2,"jsonequip":{"dps":12.25,"speed":2.1,"dmgmin1":10,"dmgmax1":20,"reqlevel":8}},"102":{"name_enus":"Worn Shortsword","quality":1,"jsonequip":{"dps":3.1,"speed":1.9,"dmgmin1":2,"dmgmax1":4}},"103":{"name_enus":"Monster - Training Sword","quality":1,"jsonequip":{"reqlevel":4}}});
+WH.Gatherer.addData(29, 16, {"1":{"name":"inv_sword_07","icon":"inv_sword_07"}});
+var tabsGroups = new Tabs({parent: WH.ge('x')});
+var listviewitems = [{"classs":2,"id":100,"level":23,"name":"Blade {of} Braces","quality":3,"slot":13,"source":[2],"sourcemore":[{"n":"Hogger","t":1,"ti":448,"z":12}],"speed":2.30,"subclass":7,firstseenpatch: 0,popularity:5},
+{"classs":2,"id":101,"level":10,"name":"Notched Shortsword","quality":2,"reqlevel":8,"slot":13,"source":[5],"sourcemore":[{"n":"Brammold Deepmine","t":1,"z":12}],"speed":2.10,"subclass":7,firstseenpatch: 0,popularity:9},
+{"classs":2,"id":101,"level":10,"name":"Notched Shortsword","quality":2,"reqlevel":8,"slot":13,"bonuses":[12719],"parentListviewRowItem":101,popularity:9},
+{"classs":2,"id":102,"level":2,"name":"Worn Shortsword","quality":1,"slot":21,"source":[2],"subclass":7,popularity:3},
+{"classs":2,"id":103,"level":44,"name":"Monster - Training Sword","quality":1,"slot":21,"subclass":7,popularity:1}];
+Filter.init({"page":"items","facets":[{"id":"name","type":"text"},{"id":"min-req-level","type":"text"},{"id":"max-req-level","type":"text"},{"id":"quality","type":"select"},{"id":"item-finder-button","type":"html"}],"activeFacets":{"min-req-level":{"id":"min-req-level","value":"0"},"max-req-level":{"id":"max-req-level","value":20}},"activeFilters":[]});
+new Listview({template: 'item', id: 'items', name: WH.TERMS.name, tabs: tabsGroups, hiddenCols: ["type"], customFilter:WH.Page.Items.parentItemFilter,data: listviewitems});
+new Listview({template: 'generic-model', id: 'itemsgallery', tabs: tabsGroups, data: WH.cOr([], listviewitems)});
+</script></body></html>`;

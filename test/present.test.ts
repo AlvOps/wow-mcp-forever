@@ -165,3 +165,66 @@ test('joinZones builds one human string', () => {
   assert.equal(joinZones(['Tanaris', 'Silithus']), 'Tanaris or Silithus');
   assert.equal(joinZones(['A', 'B', 'C', 'A']), 'A, B or C');
 });
+
+/** A page whose drop table has one solid row (5/52 = 9.6%) and one thin one (1/100 = 1%). */
+const FLOOR_HTML = `<html><head><title>Thing - Item</title></head><body><div class="text">Prose.</div>
+<script>new Listview({template: 'npc', id: 'dropped-by', data: [
+  {"id":15817,"name":"Solid Dropper","minlevel":60,"maxlevel":60,"location":[440],"count":5,"outof":52},
+  {"id":2380,"name":"Thin Dropper","minlevel":55,"maxlevel":58,"location":[405],"count":1,"outof":100}]});
+new Listview({template: 'npc', id: 'contained-in-object', data: [
+  {"id":900,"name":"Faint Chest","count":1,"outof":1000}]});
+new Listview({template: 'npc', id: 'sold-by', data: [
+  {"id":2380,"name":"Nandar Branson","minlevel":34,"maxlevel":34,"location":[405],"cost":[[500]],"stock":3}]});
+</script></body></html>`;
+
+async function floored(minChance?: number, minSamples?: number) {
+  const { c } = routedClient({});
+  const info = parsePage(FLOOR_HTML);
+  const out = await shapePage(info, 'https://www.wowhead.com/forever/item=1', { maxRows: 10, minChance, minSamples }, c);
+  return out;
+}
+
+test('minChance/minSamples filter drop rows server-side, on rows already held', async () => {
+  const all = await floored();
+  assert.equal(table(all, 'dropped-by').rows.length, 2, 'no floor: both rows present');
+
+  const floored5 = await floored(5);
+  assert.deepEqual(
+    table(floored5, 'dropped-by').rows.map((r) => r['name']),
+    ['Solid Dropper'],
+    'the 1% row is gone, the 9.6% row stays',
+  );
+  assert.equal(table(floored5, 'dropped-by')['rowsFilteredOut'], 1);
+
+  // 60 observations: the 52-kill row falls out, the 100-kill 1% row survives —
+  // proof the two floors are independent (chance is not what is being tested here).
+  const flooredSamples = await floored(undefined, 60);
+  assert.deepEqual(
+    table(flooredSamples, 'dropped-by').rows.map((r) => r['name']),
+    ['Thin Dropper'],
+    'minSamples keeps the 100-observed 1% row and drops the 52-observed 9.6% one',
+  );
+
+  // Both floors together: nothing qualifies, so the row list is empty and the
+  // payload says why rather than implying the table had no rows.
+  const both = await floored(5, 60);
+  assert.deepEqual(table(both, 'dropped-by').rows, []);
+  assert.equal(table(both, 'dropped-by')['emptyBecauseOfFilter'], true);
+});
+
+test('a floor never touches non-drop tables', async () => {
+  const out = await floored(5, 100);
+  assert.equal(table(out, 'sold-by').rows.length, 1, 'vendors are not drop rows');
+  assert.equal(table(out, 'sold-by')['rowsFilteredOut'], undefined);
+});
+
+test('a floor that empties a table says so instead of looking like "no sources"', async () => {
+  // contained-in-object here is 0.1%, so a 5% floor removes its only row.
+  const out = await floored(5);
+  const chest = table(out, 'contained-in-object');
+  assert.equal(chest.rows.length, 0);
+  assert.equal(chest['emptyBecauseOfFilter'], true);
+  assert.equal(chest['rowsFilteredOut'], 1);
+  assert.match(String(chest['filterNote']), /DOES have rows, they were filtered out/);
+  assert.equal(chest['rowsOnPage'], 1, 'the user can still see the table had a row');
+});

@@ -9,8 +9,8 @@
  * and every id-bearing reference is resolved to a name from Wowhead data
  * before it leaves the server.
  */
-import { REF_MARK, cleanFacts, formatMoney } from './wowhead/parse.js';
-import { typeByName } from './wowhead/types.js';
+import { REF_MARK, cleanFacts, decodeEntities, formatMoney, summarizeRow } from './wowhead/parse.js';
+import { QUALITY_NAMES, typeByName } from './wowhead/types.js';
 import type { GlobalNames } from './wowhead/zones.js';
 
 /** Presentation contract sent with every tool response (sibling of `source`). */
@@ -218,7 +218,8 @@ export function presentRow(row: Row, template: string | undefined, ctx: PresentC
     if (skill) out['profession'] = row['learnedat'] > 0 ? `${skill} (${row['learnedat']})` : skill;
   }
 
-  if (row['reagents'] !== undefined) out['reagents'] = itemList(pairs(row['reagents']), ctx.names) ?? UNNAMED;
+  // An empty id list means "none", not "unnamed": only a non-empty list can need a placeholder.
+  if (pairs(row['reagents'])) out['reagents'] = itemList(pairs(row['reagents']), ctx.names) ?? UNNAMED;
   const creates = row['creates'];
   if (Array.isArray(creates) && typeof creates[0] === 'number' && creates[0] > 0) {
     const name = ctx.names.get(`${ITEM}:${creates[0]}`);
@@ -226,8 +227,8 @@ export function presentRow(row: Row, template: string | undefined, ctx: PresentC
     const hi = Number(creates[2]) || lo;
     out['creates'] = name ? `${lo === hi ? lo : `${lo}-${hi}`}x ${name}` : UNNAMED;
   }
-  if (row['itemrewards'] !== undefined) out['rewards'] = itemList(pairs(row['itemrewards']), ctx.names) ?? UNNAMED;
-  if (row['itemchoices'] !== undefined) {
+  if (pairs(row['itemrewards'])) out['rewards'] = itemList(pairs(row['itemrewards']), ctx.names) ?? UNNAMED;
+  if (pairs(row['itemchoices'])) {
     const list = itemList(pairs(row['itemchoices']), ctx.names);
     out['choiceRewards'] = list ? `choose one: ${list}` : UNNAMED;
   }
@@ -249,7 +250,181 @@ export function presentMatch(r: { type: string; id: number; name: string; qualit
 }
 
 /** Append the presentation contract and the source; `source` is always the last field. */
-export function finish<T extends object>(payload: T, source: { label: string; url: string }) {
+export function finish<T extends object>(payload: T, source: { label: string; url: string }, extraGuidance?: string) {
   const { answerGuidance: _a, source: _s, ...rest } = payload as T & { answerGuidance?: unknown; source?: unknown };
-  return { ...rest, answerGuidance: ANSWER_GUIDANCE, source };
+  return { ...rest, answerGuidance: extraGuidance ? `${ANSWER_GUIDANCE} ${extraGuidance}` : ANSWER_GUIDANCE, source };
+}
+
+// ── Category listings (forever_browse) ─────────────────
+
+/** Wowhead inventory type -> slot name, for item listing rows. */
+const SLOT_NAMES: Record<number, string> = {
+  1: 'Head', 2: 'Neck', 3: 'Shoulder', 4: 'Shirt', 5: 'Chest', 6: 'Waist', 7: 'Legs', 8: 'Feet',
+  9: 'Wrist', 10: 'Hands', 11: 'Finger', 12: 'Trinket', 13: 'One-Hand', 14: 'Off Hand', 15: 'Ranged',
+  16: 'Back', 17: 'Two-Hand', 18: 'Bag', 19: 'Tabard', 20: 'Chest', 21: 'Main Hand', 22: 'Off Hand',
+  23: 'Held In Off-hand', 24: 'Projectile', 25: 'Thrown', 26: 'Ranged', 28: 'Relic',
+};
+
+/** jsonequip stat key -> player-facing name. Only these stats are shown. */
+export const ITEM_STAT_NAMES: Readonly<Record<string, string>> = {
+  str: 'strength', agi: 'agility', sta: 'stamina', int: 'intellect', spi: 'spirit',
+  atkpwr: 'attackPower', rgdatkpwr: 'rangedAttackPower', feratkpwr: 'feralAttackPower',
+  splpwr: 'spellPower', spldmg: 'spellDamage', splheal: 'healing',
+  arcsplpwr: 'arcaneSpellPower', firsplpwr: 'fireSpellPower', frosplpwr: 'frostSpellPower',
+  holsplpwr: 'holySpellPower', natsplpwr: 'natureSpellPower', shasplpwr: 'shadowSpellPower',
+  critstrkrtng: 'critRating', hitrtng: 'hitRating', hastertng: 'hasteRating', exprtng: 'expertiseRating',
+  defrtng: 'defenseRating', dodgertng: 'dodgeRating', parryrtng: 'parryRating', blockrtng: 'blockRating',
+  blockamount: 'blockValue', splpen: 'spellPenetration', manargn: 'mp5', healthrgn: 'hp5',
+  armorbonus: 'bonusArmor', arcres: 'arcaneResistance', firres: 'fireResistance', frores: 'frostResistance',
+  holres: 'holyResistance', natres: 'natureResistance', shares: 'shadowResistance',
+};
+
+/**
+ * Wowhead item `source` codes, only those confirmed against live rows
+ * (2: boss/mob drops, 4: rows whose sourcemore is a quest, 5: vendor NPCs).
+ * Unknown codes are omitted rather than guessed.
+ */
+const ITEM_SOURCE_NAMES: Record<number, string> = { 1: 'Crafted', 2: 'Drop', 4: 'Quest', 5: 'Vendor' };
+
+function num(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+function plainName(v: unknown): string | undefined {
+  if (typeof v !== 'string' || !v.trim()) return undefined;
+  // Some listviews prefix item names with their quality digit ("4Thunderfury").
+  return decodeEntities(v.replace(/^\d(?=\D)/, '')).trim();
+}
+
+/** "A, B, C" from ids named by the page's own gatherer data; undefined if any is unnamed. */
+function namedList(ids: unknown, typeId: number, names: Map<string, string>): string | undefined {
+  if (!Array.isArray(ids) || ids.length === 0) return undefined;
+  const parts = ids.map((id) => names.get(`${typeId}:${id}`));
+  return parts.every(Boolean) ? [...new Set(parts as string[])].join(', ') : undefined;
+}
+
+export interface ListingRowInput {
+  /** The listview row (or gatherer record when the page has no listview). */
+  row: Row;
+  /** Gatherer record for this row's id (item: has `jsonequip`; spell: `description_enus`). */
+  record?: Row;
+  template: string;
+  /** URL path segment for this entity type ("item", "item-set", "pet", ...). */
+  entity: string;
+  /** Gatherer type id that names ids the row references. */
+  refType?: number;
+}
+
+/**
+ * One category-listing row, user-facing: name, quality, levels as text, one
+ * zone string, a Wowhead `url`, and for items the numbers a player compares
+ * (dps, speed, damage range, armor, stats) as plain numbers. No ids, no raw keys.
+ */
+export function presentListingRow(input: ListingRowInput, ctx: PresentContext): Row {
+  const { row, record, template, entity } = input;
+  const id = num(row['id']) ?? Number(row['id']);
+  const url = Number.isFinite(id) && id > 0 ? ctx.pageUrl(entity, id) : undefined;
+
+  if (template === 'item') {
+    const equip = ((record?.['jsonequip'] as Row | undefined) ?? {}) as Row;
+    const out: Row = {};
+    const name = plainName(row['name']) ?? plainName(record?.['name_enus']) ?? plainName(row['displayName']);
+    if (name) out['name'] = name;
+    const q = num(row['quality']) ?? num(record?.['quality']);
+    if (q !== undefined && QUALITY_NAMES[q]) out['quality'] = QUALITY_NAMES[q];
+    if (url) out['url'] = url;
+    const ilvl = num(row['level']);
+    if (ilvl && ilvl > 0) out['itemLevel'] = String(ilvl);
+    const req = num(equip['reqlevel']) ?? num(row['reqlevel']);
+    if (req && req > 0) out['requiredLevel'] = String(req);
+    const slot = num(row['slot']) ?? num(equip['slotbak']);
+    if (slot !== undefined && SLOT_NAMES[slot]) out['slot'] = SLOT_NAMES[slot];
+    const dps = num(equip['dps']) ?? num(row['dps']);
+    if (dps !== undefined && dps > 0) out['dps'] = dps;
+    const speed = num(equip['speed']) ?? num(row['speed']);
+    if (speed !== undefined && speed > 0 && dps) out['speed'] = speed;
+    const lo = num(equip['dmgmin1']);
+    const hi = num(equip['dmgmax1']);
+    if (lo !== undefined && hi !== undefined && hi > 0) {
+      out['damageMin'] = lo;
+      out['damageMax'] = hi;
+    }
+    const armor = num(equip['armor']);
+    if (armor && armor > 0) out['armor'] = armor;
+    const stats: Row = {};
+    for (const [k, label] of Object.entries(ITEM_STAT_NAMES)) {
+      const v = num(equip[k]);
+      if (v) stats[label] = v;
+    }
+    if (Object.keys(stats).length) out['stats'] = stats;
+    const how = Array.isArray(row['source'])
+      ? [...new Set((row['source'] as unknown[]).map((x) => (typeof x === 'number' ? ITEM_SOURCE_NAMES[x] : undefined)).filter(Boolean))]
+      : [];
+    if (how.length) out['obtainedBy'] = how.join(', ');
+    const more = Array.isArray(row['sourcemore']) ? (row['sourcemore'] as Row[]) : [];
+    const from = [...new Set(more.map((s) => plainName(s['n'])).filter((n): n is string => !!n))];
+    if (from.length) out['from'] = from.slice(0, 3).join(', ') + (from.length > 3 ? ` and ${from.length - 3} more` : '');
+    const zones = more
+      .map((s) => num(s['z']))
+      .filter((z): z is number => z !== undefined && z > 0)
+      .map((z) => ctx.globals.areas.get(z))
+      .filter((z): z is string => !!z);
+    if (zones.length) out['zone'] = joinZones(zones);
+    const sell = num(equip['sellprice']);
+    if (sell && sell > 0) out['sellPrice'] = formatMoney(sell);
+    return out;
+  }
+
+  if (template === 'item-set') {
+    const out: Row = {};
+    const name = plainName(row['name']);
+    if (name) out['name'] = name;
+    const q = num(row['quality']);
+    if (q !== undefined && QUALITY_NAMES[q]) out['quality'] = QUALITY_NAMES[q];
+    if (url) out['url'] = url;
+    const level = levelText(row);
+    if (level) out['level'] = level;
+    const pieces = namedList(row['pieces'], ITEM, ctx.names);
+    if (pieces) out['pieces'] = pieces;
+    else if (Array.isArray(row['pieces'])) out['pieceCount'] = row['pieces'].length;
+    return out;
+  }
+
+  if (template === 'pet') {
+    const out: Row = {};
+    const name = plainName(row['name']);
+    if (name) out['name'] = name;
+    if (url) out['url'] = url;
+    const abilities = namedList(row['spells'], input.refType ?? 6, ctx.names);
+    if (abilities) out['abilities'] = abilities;
+    if (row['exotic'] === 1 || row['exotic'] === true) out['exotic'] = true;
+    return out;
+  }
+
+  if (template === 'achievement') {
+    const out: Row = {};
+    const name = plainName(row['name']) ?? plainName(record?.['name_enus']);
+    if (name) out['name'] = name;
+    if (url) out['url'] = url;
+    if (typeof row['description'] === 'string' && row['description'].trim()) out['description'] = row['description'].trim();
+    const points = num(row['points']);
+    if (points && points > 0) out['points'] = points;
+    if (typeof row['reward'] === 'string' && row['reward'].trim()) out['reward'] = row['reward'].trim();
+    return out;
+  }
+
+  // npc / quest / zone / object / faction / spell: the entity-page row conventions.
+  const out = presentRow(summarizeRow(row, template), template, ctx);
+  if (!out['name']) {
+    const name = plainName(record?.['name_enus']);
+    if (name) out['name'] = name;
+  }
+  if (!out['url'] && url) out['url'] = url;
+  if (template === 'spell') {
+    if (typeof row['rank'] === 'string' && row['rank'].trim()) out['rank'] = row['rank'].trim();
+    const desc = record?.['description_enus'];
+    const text = typeof desc === 'string' ? desc.replace(/<!--[\s\S]*?-->/g, '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() : '';
+    if (text) out['description'] = decodeEntities(text).slice(0, 240);
+  }
+  return out;
 }

@@ -14,6 +14,7 @@ import {
   parseTooltip,
   summarizeRow,
 } from './parse.js';
+import { type ListingPage, parseListingPage } from './listing.js';
 import { REAL_UA, WafTokenStore } from './token.js';
 import { type EntityType, typeById, typeByName } from './types.js';
 import { AreaNames, type GlobalNames } from './zones.js';
@@ -57,6 +58,8 @@ export function isWafChallenge(status: number, text: string): boolean {
 export class WowheadClient {
   private cache: TtlCache<string>;
   private pages: TtlCache<PageInfo>;
+  /** Parsed category listings (up to ~1000 rows each, so few are kept). */
+  private listings: TtlCache<ListingPage>;
   private tokens: TokenSource;
   private areas: AreaNames;
   private doFetch: typeof fetch;
@@ -79,6 +82,7 @@ export class WowheadClient {
     // Entity pages are ~250KB-850KB of HTML and are cached *parsed*: keeping the
     // raw strings was the one way this process could grow to a gigabyte.
     this.pages = new TtlCache<PageInfo>(env.CACHE_TTL_SECONDS * 1000, env.PAGE_CACHE_SIZE);
+    this.listings = new TtlCache<ListingPage>(env.CACHE_TTL_SECONDS * 1000, Math.min(20, env.PAGE_CACHE_SIZE));
 
     this.doFetch = deps.fetch ?? fetch;
     this.tokens =
@@ -375,6 +379,32 @@ export class WowheadClient {
     const info = parsePage(text);
     this.pages.set(url, info);
     return info;
+  }
+
+  // ── Category listing (/forever/items/weapons/..., /forever/npcs, ...) ──
+
+  /** Human-facing URL of a listing path with its filter segments. */
+  listingUrl(path: string, filters: string[] = []): string {
+    return `${this.env.WOWHEAD_BASE_URL}/${this.env.WOWHEAD_ENV}/${[path, ...filters].join('/')}`;
+  }
+
+  /**
+   * Fetch and parse one listing page. A page with neither listview rows nor
+   * gatherer records is reported as not found rather than as an empty category.
+   */
+  async listing(path: string, filters: string[] = []): Promise<ListingPage> {
+    const url = this.listingUrl(path, filters);
+    const cached = this.listings.get(url);
+    if (cached) return cached;
+    const { text } = await this.fetchStatus(url, { cacheText: false });
+    const page = parseListingPage(text);
+    const hasRows = page.listviews.some((lv) => lv.rows.length > 0) || page.gatherer.size > 0;
+    if (!hasRows) {
+      logger.debug({ url, title: page.title }, 'listing page carried no rows');
+      throw new HttpError(404, url, 'Wowhead has no listing data at this path');
+    }
+    this.listings.set(url, page);
+    return page;
   }
 
   /**

@@ -14,6 +14,8 @@ import {
   textRefs,
 } from './present.js';
 import { ENTITY_TYPE_NAMES, type EntityType, typeByName } from './wowhead/types.js';
+import { BROWSE_DEFAULT_ROWS, BROWSE_MAX_ROWS, shapeBrowse } from './browse.js';
+import { DEAD_PATHS, LISTING_SPECS, normalizeBrowsePath, specForPath } from './wowhead/listing.js';
 import { logger } from './util/logger.js';
 
 const typeSchema = z
@@ -92,11 +94,14 @@ function orderByDropChance(rows: Record<string, unknown>[], minSamples: number):
 export async function shapePage(
   info: PageInfo,
   url: string,
-  opts: { sections?: string[]; maxRows: number },
+  opts: { sections?: string[]; maxRows: number; minChance?: number; minSamples?: number },
   client: WowheadClient,
 ) {
   const wanted = opts.sections?.map((s) => s.toLowerCase());
-  const minSamples = client.dropMinSamples;
+  // Server-side filters over rows we already hold — no extra fetch. They trim what
+  // the answering model has to read, which is what makes an answer fast and tight.
+  const floorSamples = opts.minSamples ?? 0;
+  const floorChance = opts.minChance ?? 0;
 
   const prepared = info.listviews
     .filter((lv) => {
@@ -108,10 +113,31 @@ export async function shapePage(
     })
     .map((lv) => {
       let rows = lv.rows.map((r) => summarizeRow(r, lv.template));
-      const sorted = DROP_TABLES.test(lv.id.toLowerCase()) && rows.some((r) => r['dropChance'] !== undefined);
-      if (sorted) rows = orderByDropChance(rows, minSamples);
+      const isDrop = DROP_TABLES.test(lv.id.toLowerCase()) && rows.some((r) => r['dropChance'] !== undefined);
+      if (isDrop) rows = orderByDropChance(rows, client.dropMinSamples);
+
+      const before = rows.length;
+      // Filters apply only to drop tables, where chance/samples mean something.
+      if (isDrop && (floorChance > 0 || floorSamples > 0)) {
+        rows = rows.filter((r) => {
+          const chance = parseChance(r['dropChance']);
+          const samples = typeof r['samples'] === 'number' ? r['samples'] : 0;
+          if (floorChance > 0 && (chance === undefined || chance < floorChance)) return false;
+          if (floorSamples > 0 && samples < floorSamples) return false;
+          return true;
+        });
+      }
+      // A floor that empties a table must be visible: an empty table looks like
+      // "no drop sources" rather than "your filter removed them all".
+      const emptied = before > 0 && rows.length === 0 && (floorChance > 0 || floorSamples > 0);
       // Cap before naming, so only rows that are actually returned cost a lookup.
-      return { lv, rows: rows.slice(0, opts.maxRows), sorted };
+      return {
+        lv,
+        rows: rows.slice(0, opts.maxRows),
+        isDrop,
+        filteredOut: before - rows.length,
+        emptied,
+      };
     });
 
   // Name every id-bearing reference: the page's own name data first, then tooltips.
@@ -127,11 +153,18 @@ export async function shapePage(
   const globals = await client.globalNames();
   const ctx = { globals, names, pageUrl: (path: string, id: number) => client.pageUrl(path, id) };
 
-  const tables = prepared.map(({ lv, rows, sorted }) => ({
+  const tables = prepared.map(({ lv, rows, isDrop, filteredOut, emptied }) => ({
     table: lv.id,
     title: tableTitle(lv.id),
     rowsOnPage: lv.rows.length,
-    ...(sorted ? { sortedBy: `dropChance desc, rows below ${minSamples} samples last` } : {}),
+    ...(isDrop ? { sortedBy: `dropChance desc, rows below ${client.dropMinSamples} samples last` } : {}),
+    ...(filteredOut > 0 ? { rowsFilteredOut: filteredOut } : {}),
+    ...(emptied
+      ? {
+          emptyBecauseOfFilter: true,
+          filterNote: `All ${lv.rows.length} rows of "${lv.id}" fell below your minChance/minSamples floor — this table DOES have rows, they were filtered out. Re-run without the floor (or lower it) to see them.`,
+        }
+      : {}),
     rows: rows.map((r) => presentRow(r, lv.template, ctx)),
   }));
 
@@ -152,6 +185,17 @@ export async function shapePage(
     },
     sourceOf(url),
   );
+}
+
+/**
+ * "27.78%" / "0.5" → percent, for row filtering. Returns undefined when the row
+ * has no usable chance, so an unparsable row is never silently kept by a floor.
+ */
+function parseChance(value: unknown): number | undefined {
+  if (typeof value === 'number') return value <= 1 ? value * 100 : value;
+  if (typeof value !== 'string') return undefined;
+  const m = /([\d.]+)\s*%/.exec(value);
+  return m?.[1] !== undefined ? Number(m[1]) : undefined;
 }
 
 /** Where the answer came from — always the last field, so it is easy to cite. */
@@ -191,7 +235,99 @@ const PREFERRED_TYPES = ['item', 'npc', 'quest', 'object', 'zone', 'spell'];
 /** forever_find rows per table: enough to answer, small enough not to drown the answer. */
 const FIND_DEFAULT_ROWS = 5;
 
+const numOrText = z.union([z.number(), z.string()]);
+const whereSchema = z
+  .record(
+    z.string(),
+    z.union([
+      numOrText,
+      z
+        .object({ eq: numOrText, ne: numOrText, lt: numOrText, lte: numOrText, gt: numOrText, gte: numOrText })
+        .partial(),
+    ]),
+  )
+  .optional()
+  .describe(
+    'Local filter over the rows Wowhead returned, e.g. {"reqlevel":{"lte":20}}, {"dps":">=15"}, {"quality":"Rare"}. Fields: reqlevel, level (item level), dps, speed, damagemin, damagemax, armor, quality, stamina/strength/agility/intellect/spirit, minlevel/maxlevel, points.',
+  );
+
+const BROWSE_DESCRIPTION =
+  'Enumerate a WHOLE WoW: Forever category in one call — for "best/all/which X" questions such as "best in slot level 20 sword", "all potions", "every item set", "NPCs level 10-12". ' +
+  'Not for finding one thing by name (use forever_find / forever_search). ' +
+  '`path` is the Wowhead listing path after /forever/: ' +
+  'items, items/<class>, items/<class>/<subclass>[/<slot>] — classes: weapons (one-handed-swords, two-handed-swords, one-handed-axes, two-handed-axes, one-handed-maces, two-handed-maces, daggers, fist-weapons, polearms, staves, bows, guns, crossbows, wands, thrown), ' +
+  'armor (cloth, leather, mail, plate, shields, cloaks, rings, amulets, trinkets; e.g. armor/cloth/chest), consumables (potions, elixirs, flasks, food-and-drinks, bandages, scrolls), trade-goods (herbs, cloth, leather, metal-and-stone, ...), recipes (alchemy, blacksmithing, ...), containers; ' +
+  `also ${LISTING_SPECS.filter((s) => s.prefix !== 'items').map((s) => s.prefix).join(', ')}. ` +
+  '`filters` are Wowhead path segments "name:value" applied BY WOWHEAD before the 1000-row cap, e.g. ["min-req-level:0","max-req-level:20"]; ' +
+  'item pages accept min-req-level, max-req-level, min-level, max-level (item level), quality, slot, side, class; npcs accept min-level, max-level; other pages may ignore them, and the reply says so in `filtersNotApplied` — trust `filtersApplied`, never assume. ' +
+  '`where` filters the returned rows locally (reported as `rowsFilteredOut`), `sort` orders by a numeric field ("dps desc", "reqlevel asc"), `limit` caps rows (default ' +
+  `${BROWSE_DEFAULT_ROWS}, max ${BROWSE_MAX_ROWS}). ` +
+  'Wowhead shows at most 1000 rows per page: when `truncated`/`possiblyTruncated` is set, rankings cover only those rows, so narrow with `filters`. Item rows carry dps, speed, damageMin/damageMax, armor, stats, requiredLevel, itemLevel, slot and where it comes from; items with no known source (NPC-only/placeholder gear) are hidden unless includeNoSource is true.' +
+  DESCRIPTION_GUIDANCE;
+
 export function registerTools(server: McpServer, client: WowheadClient): void {
+  // ── Browse (category listing) ───────────────────────
+  server.registerTool(
+    'forever_browse',
+    {
+      title: 'Browse a WoW: Forever category',
+      description: BROWSE_DESCRIPTION,
+      inputSchema: {
+        path: z
+          .string()
+          .min(2)
+          .describe('Listing path after /forever/, e.g. "items/weapons/one-handed-swords", "item-sets", "npcs", "consumables" under items: "items/consumables/potions"'),
+        filters: z
+          .union([z.array(z.string()), z.string()])
+          .optional()
+          .describe('Wowhead path filters, e.g. ["min-req-level:0","max-req-level:20"] or "min-req-level:0/max-req-level:20"'),
+        sort: z
+          .union([z.string(), z.object({ field: z.string(), order: z.enum(['asc', 'desc']).optional() })])
+          .optional()
+          .describe('Numeric field to order by, e.g. "dps desc", "reqlevel asc", "-armor" (default order desc)'),
+        limit: z.number().int().min(1).max(BROWSE_MAX_ROWS).optional().describe(`Rows to return (default ${BROWSE_DEFAULT_ROWS}, max ${BROWSE_MAX_ROWS})`),
+        where: whereSchema,
+        includeNoSource: z
+          .boolean()
+          .optional()
+          .describe('Items only: also list items Wowhead knows no source for (NPC-only/placeholder gear). Default false.'),
+      },
+    },
+    async ({ path, filters, sort, limit, where, includeNoSource }) => {
+      try {
+        const bp = normalizeBrowsePath(path, filters);
+        const dead = DEAD_PATHS[bp.path.split('/')[0]!];
+        if (dead) return fail(dead);
+        const spec = specForPath(bp.path);
+        const page = await client.listing(bp.path, bp.filters);
+        const url = client.listingUrl(bp.path, bp.filters);
+        const globals = await client.globalNames();
+        const names = new Map<string, string>();
+        for (const [typeId, records] of page.gatherer) {
+          for (const [id, rec] of records) {
+            const n = rec['name_enus'];
+            if (typeof n === 'string' && n) names.set(`${typeId}:${id}`, n);
+          }
+        }
+        const ctx = { globals, names, pageUrl: (p: string, id: number) => client.pageUrl(p, id) };
+        const body = shapeBrowse(page, spec, bp.path, url, { where, sort, limit, requestedFilters: bp.filters, includeNoSource }, ctx);
+        const truncated = body['truncated'] === true || body['possiblyTruncated'] === true;
+        return ok(
+          finish(
+            body,
+            sourceOf(url),
+            truncated
+              ? 'This list is capped by Wowhead (see truncationNote): say the ranking covers only the rows Wowhead displayed, and suggest a narrower path or filter.'
+              : undefined,
+          ),
+        );
+      } catch (err) {
+        logger.error({ err }, 'forever_browse failed');
+        return fail(describeError(err));
+      }
+    },
+  );
+
   // ── Search ──────────────────────────────────────────
   server.registerTool(
     'forever_search',
@@ -287,13 +423,32 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
           .optional()
           .describe('Only include tables whose id contains one of these, e.g. ["dropped-by","sold-by"]'),
         maxRows: z.number().int().min(1).max(200).optional().describe('Max rows per table (default 25)'),
+        minChance: z
+          .number()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe('Drop tables only: keep rows at or above this drop chance %, e.g. 5'),
+        minSamples: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('Drop tables only: keep rows based on at least this many kills/loots, e.g. 100'),
       },
     },
-    async ({ type, id, sections, maxRows }) => {
+    async ({ type, id, sections, maxRows, minChance, minSamples }) => {
       try {
         const t = resolveType(type);
         const page = await client.page(t, id);
-        return ok(await shapePage(page, client.pageUrl(t.path, id), { sections, maxRows: maxRows ?? 25 }, client));
+        return ok(
+          await shapePage(
+            page,
+            client.pageUrl(t.path, id),
+            { sections, maxRows: maxRows ?? 25, minChance, minSamples },
+            client,
+          ),
+        );
       } catch (err) {
         logger.error({ err }, 'forever_details failed');
         return fail(describeError(err));
@@ -317,9 +472,21 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
           .optional()
           .describe('Only include tables whose id contains one of these, e.g. ["dropped-by","sold-by"]'),
         maxRows: z.number().int().min(1).max(200).optional().describe(`Max rows per table (default ${FIND_DEFAULT_ROWS})`),
+        minChance: z
+          .number()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe('Drop tables only: keep rows at or above this drop chance %, e.g. 5 — use it to get the real farm, not 200 rows'),
+        minSamples: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('Drop tables only: keep rows based on at least this many kills/loots, e.g. 100'),
       },
     },
-    async ({ name, type, sections, maxRows }) => {
+    async ({ name, type, sections, maxRows, minChance, minSamples }) => {
       try {
         const results = await client.search(name, { type: type ? resolveType(type) : undefined, limit: 8 });
         if (results.length === 0) {
@@ -351,7 +518,12 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
               }
             : {}),
           ...(others.length > 0 ? { otherMatches: others.map(presentMatch) } : {}),
-          ...(await shapePage(page, best.url, { sections, maxRows: maxRows ?? FIND_DEFAULT_ROWS }, client)),
+          ...(await shapePage(
+            page,
+            best.url,
+            { sections, maxRows: maxRows ?? FIND_DEFAULT_ROWS, minChance, minSamples },
+            client,
+          )),
         });
       } catch (err) {
         logger.error({ err }, 'forever_find failed');
