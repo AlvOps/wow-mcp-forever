@@ -16,6 +16,7 @@ import {
 } from './parse.js';
 import { REAL_UA, WafTokenStore } from './token.js';
 import { type EntityType, typeByName } from './types.js';
+import { AreaNames } from './zones.js';
 
 export class HttpError extends Error {
   constructor(
@@ -29,6 +30,7 @@ export class HttpError extends Error {
 export class WowheadClient {
   private cache: TtlCache<string>;
   private tokens: WafTokenStore;
+  private areas: AreaNames;
 
   constructor(private readonly env: Env) {
     this.cache = new TtlCache<string>(env.CACHE_TTL_SECONDS * 1000, env.CACHE_SIZE);
@@ -36,6 +38,11 @@ export class WowheadClient {
       env.WOWHEAD_TOKEN_FILE || join(homedir(), '.wowhead-token'),
       env.WOWHEAD_CHROME_PATH || undefined,
       env.WOWHEAD_TOKEN_MAX_AGE_HOURS,
+    );
+    this.areas = new AreaNames(
+      `${env.WOWHEAD_TOOLTIP_URL}/${env.WOWHEAD_ENV}/data/global`,
+      env.HTTP_TIMEOUT_MS,
+      REAL_UA,
     );
   }
 
@@ -137,6 +144,14 @@ export class WowheadClient {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Area id -> name table, from Wowhead's own global page data. Tables report
+   * numeric `location` ids; without this a model invents the zone names.
+   */
+  async areaNames(): Promise<Map<number, string>> {
+    return this.areas.load();
   }
 
   // ── Search ──

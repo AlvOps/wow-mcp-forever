@@ -10,6 +10,7 @@ import {
   parseTooltip,
   summarizeRow,
 } from '../src/wowhead/parse.js';
+import { parseAreaNames } from '../src/wowhead/zones.js';
 import { ITEM_PAGE, ITEM_XML, SUGGESTIONS, TOOLTIP } from './fixtures.js';
 
 const url = (p: string, id: number) => `https://www.wowhead.com/forever/${p}=${id}`;
@@ -73,4 +74,40 @@ test('text helpers', () => {
   assert.equal(formatMoney(10203), '1g 2s 3c');
   assert.equal(markupToText('[ul][li]Start: [npc=123][/li][/ul]'), '- Start: npc #123');
   assert.equal(htmlToText('a<br>b &amp; <span>c</span>'), 'a\nb & c');
+});
+
+// ── Area names: listview rows give numeric ids, so a model handed only those
+//    invents the zone names. This table is what makes them sourced. ──
+
+test('parseAreaNames reads the area id -> name table', () => {
+  // Shape taken from a live nether.wowhead.com/forever/data/global response,
+  // including the other setPageData calls that surround it.
+  const global = [
+    'WH.setPageData("maps.continents",{"1":"Eastern Kingdoms"});',
+    'WH.setPageData("wow.area.names",{"-6":"Kalimdor","-3":"Eastern Kingdoms","45":"Arathi Highlands",',
+    '"400":"Thousand Needles","405":"Desolace","796":"Scarlet Monastery","16591":"Riverglades"});',
+    'WH.setPageData("url.alternatePathCommands",{"x":{"1":"y"}});',
+  ].join('');
+  const m = parseAreaNames(global);
+  assert.equal(m.size, 7);
+  assert.equal(m.get(405), 'Desolace');
+  assert.equal(m.get(45), 'Arathi Highlands');
+  assert.equal(m.get(16591), 'Riverglades');
+  // negative ids are continents/regions and are valid rows too
+  assert.equal(m.get(-3), 'Eastern Kingdoms');
+  assert.equal(m.get(-6), 'Kalimdor');
+  assert.equal(m.get(999999), undefined);
+});
+
+test('parseAreaNames keeps braces that appear inside a name', () => {
+  const m = parseAreaNames('WH.setPageData("wow.area.names",{"1":"Brace { City","2":"Two"})');
+  assert.equal(m.size, 2);
+  assert.equal(m.get(1), 'Brace { City');
+});
+
+test('parseAreaNames degrades to an empty map instead of throwing', () => {
+  assert.equal(parseAreaNames('WH.setPageData("something.else",{"1":"x"})').size, 0);
+  assert.equal(parseAreaNames('WH.setPageData("wow.area.names", not json)').size, 0);
+  assert.equal(parseAreaNames('WH.setPageData("wow.area.names",').size, 0);
+  assert.equal(parseAreaNames('').size, 0);
 });

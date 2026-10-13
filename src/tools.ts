@@ -30,27 +30,60 @@ function resolveType(name: string): EntityType {
   return t;
 }
 
-/** Shape a parsed page for the model: compact rows, capped per table. */
-function shapePage(
+const ROW_NOTE = 'Rows keep the raw numeric `location` ids and add `locations` with the area names taken from Wowhead.';
+
+/**
+ * Shape a parsed page for the model: compact rows, capped per table.
+ *
+ * Row `location` values are numeric area ids, and a model handed bare ids will
+ * supply the zone names from its own knowledge — which reads as authoritative
+ * but does not come from the data source. So every id used on the page is
+ * resolved against Wowhead's own area-name table and added as `locations`.
+ */
+async function shapePage(
   info: PageInfo,
   url: string,
   opts: { sections?: string[]; maxRows: number },
+  client: WowheadClient,
 ) {
   const wanted = opts.sections?.map((s) => s.toLowerCase());
-  const tables = info.listviews
+  const prepared = info.listviews
     .filter((lv) => !wanted || wanted.some((w) => lv.id.toLowerCase().includes(w)))
     .map((lv) => ({
-      table: lv.id,
-      total: lv.rows.length,
+      lv,
       rows: lv.rows.slice(0, opts.maxRows).map((r) => summarizeRow(r, lv.template)),
     }));
+
+  const ids = new Set<number>();
+  for (const { rows } of prepared) {
+    for (const row of rows) {
+      const loc = row['location'];
+      if (Array.isArray(loc)) for (const id of loc) if (typeof id === 'number') ids.add(id);
+    }
+  }
+
+  if (ids.size > 0) {
+    const names = await client.areaNames();
+    if (names.size > 0) {
+      for (const { rows } of prepared) {
+        for (const row of rows) {
+          const loc = row['location'];
+          if (!Array.isArray(loc)) continue;
+          const resolved = loc.map((id) => (typeof id === 'number' ? names.get(id) : undefined)).filter(Boolean);
+          if (resolved.length > 0) row['locations'] = resolved;
+        }
+      }
+    }
+  }
+
   return {
     url,
     title: info.title,
     description: info.description,
     quickFacts: info.quickFacts,
     text: info.text,
-    tables,
+    note: ROW_NOTE,
+    tables: prepared.map(({ lv, rows }) => ({ table: lv.id, total: lv.rows.length, rows })),
     availableTables: info.listviews.map((lv) => `${lv.id} (${lv.rows.length})`),
   };
 }
@@ -103,7 +136,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
         if (!tooltip && !item) {
           // Fall back to the full page so the model still gets something useful.
           const page = await client.page(t, id);
-          return ok(shapePage(page, client.pageUrl(t.path, id), { maxRows: 10 }));
+          return ok(await shapePage(page, client.pageUrl(t.path, id), { maxRows: 10 }, client));
         }
         return ok({ type: t.name, id, url: client.pageUrl(t.path, id), ...tooltip, ...(item ? { item } : {}) });
       } catch (err) {
@@ -119,7 +152,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'WoW: Forever full details',
       description:
-        'Read the full Wowhead Forever page for an entity: quick facts, description/objectives, and data tables such as dropped-by (with drop chance), drops, sold-by, starts/ends quest, objective-of, reward-from, created-by, reagent-for, teaches, quests in a zone. Use `sections` to only return certain tables.',
+        'Read the full Wowhead Forever page for an entity: quick facts, description/objectives, and data tables such as dropped-by (with drop chance), drops, sold-by, starts/ends quest, objective-of, reward-from, created-by, reagent-for, teaches, quests in a zone. Use `sections` to only return certain tables. Rows carry numeric `location` ids plus `locations` area names.',
       inputSchema: {
         type: typeSchema,
         id: z.number().int().positive().describe('Wowhead id from forever_search'),
@@ -134,7 +167,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
       try {
         const t = resolveType(type);
         const page = await client.page(t, id);
-        return ok(shapePage(page, client.pageUrl(t.path, id), { sections, maxRows: maxRows ?? 25 }));
+        return ok(await shapePage(page, client.pageUrl(t.path, id), { sections, maxRows: maxRows ?? 25 }, client));
       } catch (err) {
         logger.error({ err }, 'forever_details failed');
         return fail(describeError(err));
@@ -148,7 +181,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'Find in WoW: Forever',
       description:
-        'One-step answer for questions like "where does X drop", "who sells X", "how do I start quest X": searches WoW: Forever by name, then returns full details of the best match plus the other candidates.',
+        'One-step answer for questions like "where does X drop", "who sells X", "how do I start quest X": searches WoW: Forever by name, then returns full details of the best match plus the other candidates. Rows carry numeric `location` ids plus `locations` area names.',
       inputSchema: {
         name: z.string().min(2).describe('Name of the item, quest, NPC, zone, ...'),
         type: typeSchema.optional().describe('Restrict to this kind of thing (recommended)'),
@@ -165,7 +198,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
         const page = await client.page(t, best.id);
         return ok({
           match: { type: best.type, id: best.id, name: best.name },
-          ...shapePage(page, best.url, { maxRows: maxRows ?? 15 }),
+          ...(await shapePage(page, best.url, { maxRows: maxRows ?? 15 }, client)),
           otherMatches: results.filter((r) => r !== best),
         });
       } catch (err) {
