@@ -62,7 +62,37 @@ export const LISTING_SPECS: readonly ListingSpec[] = [
   { prefix: 'zones', entity: 'zone', template: 'zone', listview: 'zones', label: 'zones' },
   { prefix: 'factions', entity: 'faction', template: 'faction', listview: 'factions', label: 'factions' },
   { prefix: 'quests', entity: 'quest', template: 'quest', listview: 'quests', refType: 3, label: 'quests' },
+  { prefix: 'guides', entity: 'guide', template: 'guide', listview: 'guides', label: 'guides' },
 ];
+
+/**
+ * Short names for the zone listing, already narrowed. Wowhead has no
+ * /forever/dungeons page (verified 404) and the zones listing ignores every
+ * path filter — it answers with all 143 zones whatever you append — so the
+ * narrowing is done locally on the columns the page carries (parse.ts maps
+ * `instance`/`territory` to the words the site prints). "which Forever
+ * dungeons exist" is a real question the tool had no answer for before this.
+ */
+export const BROWSE_ALIASES: Readonly<
+  Record<string, { segment: string; where?: Record<string, string> }>
+> = {
+  dungeons: { segment: 'zones', where: { instanceType: 'Dungeon' } },
+  instances: { segment: 'zones', where: { instanceType: 'Dungeon' } },
+  raids: { segment: 'zones', where: { instanceType: 'Raid' } },
+  battlegrounds: { segment: 'zones', where: { instanceType: 'Battleground' } },
+  bgs: { segment: 'zones', where: { instanceType: 'Battleground' } },
+};
+
+/** First path segment of a browse path, lowercased, filters stripped. */
+export function firstSegment(rawPath: string): string {
+  const p = rawPath.trim().toLowerCase().replace(/^https?:\/\/[^/]+/, '').replace(/[?#].*$/, '');
+  return p.replace(/^\/+/, '').replace(/^forever\//, '').split('/')[0] ?? '';
+}
+
+/** The local `where` an alias implies, if the path's first segment is one. */
+export function browseAliasWhere(rawPath: string): Record<string, string> | undefined {
+  return BROWSE_ALIASES[firstSegment(rawPath)]?.where;
+}
 
 /** Listing paths Wowhead answers with 404 or with an empty landing page (verified). */
 export const DEAD_PATHS: Readonly<Record<string, string>> = {
@@ -112,6 +142,10 @@ export function normalizeBrowsePath(rawPath: string, rawFilters?: string[] | str
     filters.push(f);
   }
   if (path.length === 0) throw new Error('`path` is empty. Example: "items/weapons/one-handed-swords".');
+  // Aliases resolve to the listing page that exists; the narrowing they imply
+  // is applied as a local `where` by the caller (browseAliasWhere).
+  const alias = BROWSE_ALIASES[path[0]!];
+  if (alias) path[0] = alias.segment;
   // One value per filter name: the last one given wins.
   const byName = new Map<string, string>();
   for (const f of filters) byName.set(f.split(':')[0]!, f);

@@ -26,6 +26,11 @@ export const ENTITY_TYPES: EntityType[] = [
   { id: 14, name: 'race', path: 'race', tooltip: 'race' },
   { id: 15, name: 'skill', path: 'skill', tooltip: 'skill' },
   { id: 17, name: 'currency', path: 'currency', tooltip: 'currency' },
+  // Guides are real Forever content — the documented walkthroughs of the
+  // added dungeons live here (e.g. /forever/guide=34887, The Hall of Thanes),
+  // and Wowhead's search returns them next to zones. Their canonical URL is a
+  // slug (/forever/guide/<slug>), not `<path>=<id>`; see client.looksLikeEntity.
+  { id: 100, name: 'guide', path: 'guide', tooltip: 'guide' },
 ];
 
 export const ENTITY_TYPE_NAMES = ENTITY_TYPES.map((t) => t.name) as [string, ...string[]];

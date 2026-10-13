@@ -12,6 +12,7 @@
  */
 import { presentListingRow, type PresentContext } from './present.js';
 import { type ListingPage, type ListingSpec, primaryListview } from './wowhead/listing.js';
+import { environmentChange, INSTANCE_TYPE_NAMES, TERRITORY_NAMES } from './wowhead/parse.js';
 import { QUALITY_NAMES } from './wowhead/types.js';
 
 /** Hard cap on rows returned in one response. */
@@ -47,6 +48,11 @@ const FIELD_ALIASES: Record<string, string> = {
   healing: 'splheal', critrating: 'critstrkrtng', hitrating: 'hitrtng', defenserating: 'defrtng',
   mp5: 'manargn', hp5: 'healthrgn', sellprice: 'sellprice', bonusarmor: 'armorbonus',
   durability: 'dura', minlevel: 'minlevel', maxlevel: 'maxlevel', points: 'points',
+  // Zones/instances: the words the site prints in its own columns.
+  instancetype: 'instance', instance: 'instance', itype: 'instance',
+  faction: 'territory', side: 'territory', territory: 'territory',
+  players: 'nplayers', nplayers: 'nplayers', pop: 'popularity', popularity: 'popularity',
+  changes: 'changes', change: 'changes', new: 'changes', status: 'changes',
 };
 
 export function fieldKey(name: string): string {
@@ -62,6 +68,15 @@ function flatFields(...sources: Array<Record<string, unknown> | undefined>): Rec
       if (typeof v === 'number' && Number.isFinite(v)) out[norm(k)] = v;
       else if (typeof v === 'string' && v.length < 200) out[norm(k)] ??= v;
     }
+    // Zone rows carry their Territory and Instance type as ids, and the Changes
+    // flag as an object. Compare them as the words the site shows, so a local
+    // `where` can say what a reader says: {territory: "Alliance"}.
+    const inst = src['instance'];
+    if (typeof inst === 'number' && INSTANCE_TYPE_NAMES[inst]) out['instance'] = INSTANCE_TYPE_NAMES[inst]!;
+    const terr = src['territory'];
+    if (typeof terr === 'number' && TERRITORY_NAMES[terr]) out['territory'] = TERRITORY_NAMES[terr]!;
+    const change = environmentChange(src['envChange']);
+    if (change && out['changes'] === undefined) out['changes'] = change;
   }
   return out;
 }
@@ -253,6 +268,8 @@ export interface BrowseOptions {
   requestedFilters: string[];
   /** Items: keep rows Wowhead knows no source for (NPC-only "Monster -" gear, [TMP] placeholders). */
   includeNoSource?: boolean;
+  /** Path alias the caller used ("dungeons"), when it was not a real Wowhead path. */
+  aliasFrom?: string;
 }
 
 /** An item Wowhead lists with no source at all: NPC-only, placeholder or unreleased. */
@@ -339,6 +356,14 @@ export function shapeBrowse(
       ? {
           noSourceHidden,
           noSourceNote: `${noSourceHidden} items with no known source on Wowhead (NPC-only "Monster -" weapons, "[TMP]" placeholders, unreleased items) are hidden so they cannot top a ranking; pass includeNoSource:true to list them.`,
+        }
+      : {}),
+    ...(opts.aliasFrom
+      ? {
+          aliasedFrom: opts.aliasFrom,
+          aliasNote: `"${opts.aliasFrom}" is a short name for the ${path} listing on Wowhead, narrowed locally${
+            whereUsed ? ` by ${Object.entries(opts.where ?? {}).map(([k, v]) => `${k}=${String(v)}`).join(', ')}` : ''
+          }. Wowhead has no page of its own for it.`,
         }
       : {}),
     ...(whereUsed ? { rowsMatched: kept.length, rowsFilteredOut: removed } : {}),

@@ -56,3 +56,29 @@ Filter.init({"page":"items","facets":[{"id":"name","type":"text"},{"id":"min-req
 new Listview({template: 'item', id: 'items', name: WH.TERMS.name, tabs: tabsGroups, hiddenCols: ["type"], customFilter:WH.Page.Items.parentItemFilter,data: listviewitems});
 new Listview({template: 'generic-model', id: 'itemsgallery', tabs: tabsGroups, data: WH.cOr([], listviewitems)});
 </script></body></html>`;
+
+/**
+ * A name whose best search hit cannot be opened: Wowhead returns a news post
+ * (type 162, no entity page, no tooltip) above the zone. forever_find must fall
+ * through to the zone instead of failing the call — "The Hall of Thanes" is the
+ * live case that produced `Error: Unknown type "guide"`.
+ */
+export const SUGGESTIONS_NEWS_FIRST = {
+  search: 'hall of thanes walkthrough',
+  results: [
+    { type: 162, id: 382991, name: 'Hall of Thanes Walkthrough', typeName: 'News Post' },
+    { type: 7, id: 16919, name: 'The Hall of Thanes', typeName: 'Zone' },
+  ],
+};
+
+/** Only unusable hits: the call must still answer, with links, not fail. */
+export const SUGGESTIONS_NEWS_ONLY = {
+  search: 'ruins of lordaeron preview',
+  results: [{ type: 162, id: 383151, name: 'Ruins of Lordaeron Preview', typeName: 'News Post' }],
+};
+
+export const ZONE_PAGE =
+  `<html><head><title>The Hall of Thanes - Zone - Forever</title>` +
+  `<link rel="canonical" href="https://www.wowhead.com/forever/zone=16919"></head>` +
+  `<body><script>new Listview({id:'quests',template:'quest',data:[` +
+  `{id:96403,name:'Important Heirlooms',level:14}]});</script></body></html>`;

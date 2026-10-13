@@ -251,3 +251,22 @@ test('a page whose canonical link points elsewhere is treated as missing', async
   const c = client(scriptedFetch([{ status: 200, body: LISTING }]).impl);
   await assert.rejects(() => c.page(typeById(3)!, 279841), /HTTP 404/);
 });
+
+test('a guide page is reachable even though its canonical is a slug without the id', async () => {
+  // Live: /forever/guide=34887 canonicalises to
+  // /forever/guide/hall-of-thanes-dungeon-overview-location-rewards — no `guide=34887`
+  // anywhere — so the id-in-canonical test threw a fake 404 on a page that fetched fine.
+  const GUIDE = `<html><head><title>The Hall of Thanes Dungeon Overview Guide - Wow Forever - Wowhead</title>` +
+    `<link rel="canonical" href="https://www.wowhead.com/forever/guide/hall-of-thanes-dungeon-overview-location-rewards"></head>` +
+    `<body><script>new Listview({id:'quests',template:'quest',data:[{id:96403,name:'Important Heirlooms',level:14}]});</script></body></html>`;
+  const c = client(scriptedFetch([{ status: 200, body: GUIDE }]).impl);
+  const page = await c.page(typeById(100)!, 34887);
+  assert.match(String(page.title), /Hall of Thanes/);
+  assert.equal(page.listviews[0]!.rows[0]!['name'], 'Important Heirlooms');
+});
+
+test('the guides listing is still not an entity page for guide=<id>', async () => {
+  // Same trailing-slash rule: /forever/guides has no `/guide/` segment.
+  const c = client(scriptedFetch([{ status: 200, body: `<html><title>Forever Guides</title><link rel="canonical" href="https://www.wowhead.com/forever/guides"></html>` }]).impl);
+  await assert.rejects(() => c.page(typeById(100)!, 999999), /HTTP 404/);
+});

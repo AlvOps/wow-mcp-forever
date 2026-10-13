@@ -389,7 +389,27 @@ const KEEP_FIELDS = [
   'percent', 'skill', 'learnedat', 'colors', 'nreagents', 'reagents', 'location',
   'tag', 'boss', 'classification', 'rank', 'itemrewards', 'xp', 'money', 'avail',
   'quality', 'creates', 'stock', 'itemchoices',
+  // Zones/instances (the /forever/zones listing): what the site shows as
+  // Territory, Instance type and Pop. columns.
+  'instance', 'territory', 'nplayers', 'popularity', 'envChange',
 ] as const;
+
+/** Wowhead zone `instance` ids -> the site's own Instance type column. */
+export const INSTANCE_TYPE_NAMES: Readonly<Record<number, string>> = {
+  0: 'Zone',
+  2: 'Dungeon',
+  3: 'Raid',
+  4: 'Battleground',
+};
+
+/** Wowhead zone `territory` ids -> the site's own Territory column. */
+export const TERRITORY_NAMES: Readonly<Record<number, string>> = {
+  0: 'Alliance',
+  1: 'Horde',
+  2: 'Contested',
+  3: 'Sanctuary',
+  4: 'PvP',
+};
 
 /** Reduce a raw listview row to compact, readable fields. */
 export function summarizeRow(row: Record<string, unknown>, template?: string): Record<string, unknown> {
@@ -431,7 +451,31 @@ export function summarizeRow(row: Record<string, unknown>, template?: string): R
   if (out['side'] !== undefined) {
     out['side'] = { 1: 'Alliance', 2: 'Horde', 3: 'Both' }[out['side'] as number] ?? out['side'];
   }
+  // Zone rows: the raw numbers Wowhead's own table renders as icons/words.
+  // "Alliance"/"Horde" here is the zone's territory, not a quest's side.
+  if (typeof out['instance'] === 'number') {
+    const t = INSTANCE_TYPE_NAMES[out['instance']];
+    if (t) out['instanceType'] = t;
+    delete out['instance'];
+  }
+  if (typeof out['territory'] === 'number') {
+    out['territory'] = TERRITORY_NAMES[out['territory']] ?? out['territory'];
+  }
+  if (typeof out['nplayers'] === 'number') {
+    if (out['nplayers'] > 0) out['players'] = out['nplayers'];
+    delete out['nplayers'];
+  }
+  const change = environmentChange(out['envChange']);
+  delete out['envChange'];
+  if (change) out['changes'] = change;
   return out;
+}
+
+/** `envChange: {status: "new"|"unchanged"}` -> the site's Changes column. */
+export function environmentChange(v: unknown): string | undefined {
+  const status = v && typeof v === 'object' ? (v as Record<string, unknown>)['status'] : undefined;
+  if (typeof status !== 'string' || !status) return undefined;
+  return status === 'new' ? 'New' : status === 'unchanged' ? 'Unchanged' : status;
 }
 
 // ── Entity page ────────────────────────────────────────

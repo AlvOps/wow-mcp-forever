@@ -8,7 +8,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { ITEM_PAGE, ITEM_XML, SUGGESTIONS, SWORDS_HTML, TOOLTIP } from './fixtures.js';
+import { ITEM_PAGE, ITEM_XML, SUGGESTIONS, SUGGESTIONS_NEWS_FIRST, SUGGESTIONS_NEWS_ONLY, SWORDS_HTML, TOOLTIP, ZONE_PAGE } from './fixtures.js';
 
 let fake: Server;
 let client: Client;
@@ -18,7 +18,12 @@ before(async () => {
   fake = createServer((req, res) => {
     const u = req.url ?? '';
     hits.push(u);
-    if (u.startsWith('/forever/search/suggestions-template')) return res.end(JSON.stringify(SUGGESTIONS));
+    if (u.startsWith('/forever/search/suggestions-template')) {
+      if (/hall/i.test(u)) return res.end(JSON.stringify(SUGGESTIONS_NEWS_FIRST));
+      if (/preview/i.test(u)) return res.end(JSON.stringify(SUGGESTIONS_NEWS_ONLY));
+      return res.end(JSON.stringify(SUGGESTIONS));
+    }
+    if (u === '/forever/zone=16919') return res.end(ZONE_PAGE);
     if (u.startsWith('/forever/tooltip/item/279841')) return res.end(JSON.stringify(TOOLTIP));
     if (u === '/forever/item=279841&xml') return res.end(ITEM_XML);
     if (u === '/forever/item=279841') return res.end(ITEM_PAGE);
@@ -86,6 +91,24 @@ test('forever_find picks exact match', async () => {
   assert.deepEqual([m['type'], m['id'], m['name']], ['item', 279841, 'Defender of Dalaran']);
   assert.match(String(m['url']), /\/forever\/item=279841$/, 'the id always travels with a link');
   assert.ok((r['tables'] as unknown[]).length === 2);
+});
+
+test('forever_find falls through a candidate whose page cannot be opened', async () => {
+  const r = body(await client.callTool({ name: 'forever_find', arguments: { name: 'Hall of Thanes Walkthrough' } }));
+  const m = r['match'] as Record<string, unknown>;
+  assert.deepEqual([m['type'], m['id']], ['zone', 16919]);
+  assert.match(String(m['url']), /\/forever\/zone=16919$/, 'the id always travels with a link');
+  assert.match(String((r['unusableMatches'] as string[])[0]), /news post/i, 'and the skipped hit is named, not hidden');
+});
+
+test('forever_find is never a dead end when no candidate can be opened', async () => {
+  const res = await client.callTool({ name: 'forever_find', arguments: { name: 'Ruins of Lordaeron Preview' } });
+  assert.notEqual(res.isError, true, 'an unopenable hit must not fail the call');
+  const r = body(res);
+  const matches = r['matches'] as Record<string, unknown>[];
+  assert.equal(matches.length, 1);
+  assert.match(String(matches[0]!['url']), /forever/);
+  assert.equal(r['source'] !== undefined, true);
 });
 
 test('every tool response ends with answerGuidance then source', async () => {

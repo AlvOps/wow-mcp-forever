@@ -15,7 +15,14 @@ import {
 } from './present.js';
 import { ENTITY_TYPE_NAMES, type EntityType, typeByName } from './wowhead/types.js';
 import { BROWSE_DEFAULT_ROWS, BROWSE_MAX_ROWS, shapeBrowse } from './browse.js';
-import { DEAD_PATHS, LISTING_SPECS, normalizeBrowsePath, specForPath } from './wowhead/listing.js';
+import {
+  browseAliasWhere,
+  DEAD_PATHS,
+  firstSegment,
+  LISTING_SPECS,
+  normalizeBrowsePath,
+  specForPath,
+} from './wowhead/listing.js';
 import { logger } from './util/logger.js';
 
 const typeSchema = z
@@ -248,7 +255,7 @@ const whereSchema = z
   )
   .optional()
   .describe(
-    'Local filter over the rows Wowhead returned, e.g. {"reqlevel":{"lte":20}}, {"dps":">=15"}, {"quality":"Rare"}. Fields: reqlevel, level (item level), dps, speed, damagemin, damagemax, armor, quality, stamina/strength/agility/intellect/spirit, minlevel/maxlevel, points.',
+    'Local filter over the rows Wowhead returned, e.g. {"reqlevel":{"lte":20}}, {"dps":">=15"}, {"quality":"Rare"}. Item fields: reqlevel, level (item level), dps, speed, damagemin, damagemax, armor, quality, stamina/strength/agility/intellect/spirit, points. Zone/instance fields (path "zones"): instanceType (Zone, Dungeon, Raid, Battleground), territory (Alliance, Horde, Contested, Sanctuary, PvP), changes (New, Unchanged), players, minlevel, maxlevel, popularity.',
   );
 
 const BROWSE_DESCRIPTION =
@@ -258,6 +265,9 @@ const BROWSE_DESCRIPTION =
   'items, items/<class>, items/<class>/<subclass>[/<slot>] — classes: weapons (one-handed-swords, two-handed-swords, one-handed-axes, two-handed-axes, one-handed-maces, two-handed-maces, daggers, fist-weapons, polearms, staves, bows, guns, crossbows, wands, thrown), ' +
   'armor (cloth, leather, mail, plate, shields, cloaks, rings, amulets, trinkets; e.g. armor/cloth/chest), consumables (potions, elixirs, flasks, food-and-drinks, bandages, scrolls), trade-goods (herbs, cloth, leather, metal-and-stone, ...), recipes (alchemy, blacksmithing, ...), containers; ' +
   `also ${LISTING_SPECS.filter((s) => s.prefix !== 'items').map((s) => s.prefix).join(', ')}. ` +
+  'Zone rows (path "zones") carry instanceType, territory, changes, players and the level range, so "which Forever dungeons are there", "which instances are Alliance", "what is new in Forever" are `where` filters: ' +
+  '{"instanceType":"Dungeon"}, {"territory":"Alliance"}, {"changes":"New"} (territory is the zone\'s own Alliance/Horde/Contested, not quest side). ' +
+  'Wowhead has no /forever/dungeons page: "dungeons", "instances", "raids", "battlegrounds" are short names for "zones" narrowed to those instance types, and the reply says so in `aliasedFrom`. ' +
   '`filters` are Wowhead path segments "name:value" applied BY WOWHEAD before the 1000-row cap, e.g. ["min-req-level:0","max-req-level:20"]; ' +
   'item pages accept min-req-level, max-req-level, min-level, max-level (item level), quality, slot, side, class; npcs accept min-level, max-level; other pages may ignore them, and the reply says so in `filtersNotApplied` — trust `filtersApplied`, never assume. ' +
   '`where` filters the returned rows locally (reported as `rowsFilteredOut`), `sort` orders by a numeric field ("dps desc", "reqlevel asc"), `limit` caps rows (default ' +
@@ -299,6 +309,11 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
         const dead = DEAD_PATHS[bp.path.split('/')[0]!];
         if (dead) return fail(dead);
         const spec = specForPath(bp.path);
+        // A short name ("dungeons") resolves to the listing page Wowhead has and
+        // is narrowed here, on the fields the page carries; the caller's own
+        // `where` wins over the alias's.
+        const aliasWhere = browseAliasWhere(path);
+        const mergedWhere = { ...(aliasWhere ?? {}), ...(where ?? {}) };
         const page = await client.listing(bp.path, bp.filters);
         const url = client.listingUrl(bp.path, bp.filters);
         const globals = await client.globalNames();
@@ -310,7 +325,21 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
           }
         }
         const ctx = { globals, names, pageUrl: (p: string, id: number) => client.pageUrl(p, id) };
-        const body = shapeBrowse(page, spec, bp.path, url, { where, sort, limit, requestedFilters: bp.filters, includeNoSource }, ctx);
+        const body = shapeBrowse(
+          page,
+          spec,
+          bp.path,
+          url,
+          {
+            where: Object.keys(mergedWhere).length > 0 ? mergedWhere : undefined,
+            sort,
+            limit,
+            requestedFilters: bp.filters,
+            includeNoSource,
+            ...(aliasWhere ? { aliasFrom: firstSegment(path) } : {}),
+          },
+          ctx,
+        );
         const truncated = body['truncated'] === true || body['possiblyTruncated'] === true;
         return ok(
           finish(
@@ -334,7 +363,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'Search WoW: Forever',
       description:
-        'Search the Wowhead World of Warcraft: Forever database by name. Returns matching items, quests, NPCs, spells, zones, etc. with their Wowhead links; the `id` is only for calling forever_lookup or forever_details.' +
+        'Search the Wowhead World of Warcraft: Forever database by name. Returns matching items, quests, NPCs, spells, zones, guides, etc. with their Wowhead links; the `id` is only for calling forever_lookup or forever_details. Guides are the written walkthroughs of Forever content ("The Hall of Thanes Dungeon Overview Guide"): read one with forever_details type "guide".' +
         DESCRIPTION_GUIDANCE,
       inputSchema: {
         query: z.string().min(2).describe('Name or partial name, e.g. "Defender of Dalaran" or "Hogger"'),
@@ -462,7 +491,7 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
     {
       title: 'Find in WoW: Forever',
       description:
-        'One-step answer for questions like "where does X drop", "who sells X", "how do I start quest X": searches WoW: Forever by name, then returns details of the best match plus the other candidates. Rows carry a `zone` name, a level range and a Wowhead `url`; drop tables are ordered by drop chance and report sample sizes, so low-sample flukes are not presented as solid rates. Returns the top rows per table; use forever_details with `sections` for more of one table.' +
+        'One-step answer for questions like "where does X drop", "who sells X", "how do I start quest X": searches WoW: Forever by name, then returns details of the best match plus the other candidates. Rows carry a `zone` name, a level range and a Wowhead `url`; drop tables are ordered by drop chance and report sample sizes, so low-sample flukes are not presented as solid rates. Returns the top rows per table; use forever_details with `sections` for more of one table. A name whose best match cannot be opened (a news post) falls through to the next candidate instead of failing, and `unusableMatches` says which were skipped and why.' +
         DESCRIPTION_GUIDANCE,
       inputSchema: {
         name: z.string().min(2).describe('Name of the item, quest, NPC, zone, ...'),
@@ -501,30 +530,65 @@ export function registerTools(server: McpServer, client: WowheadClient): void {
         // the same thing). Prefer the kinds a player is usually asking about, and
         // say plainly when the name was ambiguous.
         const exactMatches = results.filter((r) => r.name.toLowerCase() === name.toLowerCase());
-        const best: SearchResult =
-          exactMatches.find((r) => PREFERRED_TYPES.includes(r.type)) ?? exactMatches[0] ?? results[0]!;
-        const collisions = exactMatches.filter((r) => r !== best);
-        const others = results.filter((r) => r !== best && !collisions.includes(r));
-        const t = resolveType(best.type);
-        const page = await client.page(t, best.id);
-        // shapePage ends with `answerGuidance` then `source`, so the link to
-        // where the answer came from is always the last thing in the reply.
-        return ok({
-          match: presentMatch(best),
-          ...(collisions.length > 0
-            ? {
-                nameCollisions: collisions.map(presentMatch),
-                nameCollisionNote: 'Other entries with the same name; tell them apart by quality and link, not by id.',
-              }
-            : {}),
-          ...(others.length > 0 ? { otherMatches: others.map(presentMatch) } : {}),
-          ...(await shapePage(
-            page,
-            best.url,
-            { sections, maxRows: maxRows ?? FIND_DEFAULT_ROWS, minChance, minSamples },
-            client,
-          )),
-        });
+        // Search returns kinds with no entity page on Wowhead at all (news posts)
+        // and kinds whose page only arrived later (guides). Trying the first
+        // candidate and throwing made the whole call fail on a name whose best
+        // hit was one of those — "The Hall of Thanes" is exactly that case. Try
+        // candidates in preference order and keep the reason each was dropped.
+        const preferred = exactMatches.filter((r) => PREFERRED_TYPES.includes(r.type));
+        const ordered: SearchResult[] = [];
+        for (const r of [...preferred, ...exactMatches, ...results]) {
+          if (!ordered.includes(r)) ordered.push(r);
+        }
+        const unusable: string[] = [];
+        for (const cand of ordered) {
+          const t = typeByName(cand.type);
+          if (!t) {
+            unusable.push(`${cand.name} (${cand.type}: Wowhead has no page to open)`);
+            continue;
+          }
+          let page: PageInfo;
+          try {
+            page = await client.page(t, cand.id);
+          } catch (err) {
+            logger.debug({ err, type: cand.type, id: cand.id }, 'forever_find: candidate page unavailable');
+            unusable.push(`${cand.name} (${cand.type}: ${describeError(err)})`);
+            continue;
+          }
+          const collisions = exactMatches.filter((r) => r !== cand);
+          const others = results.filter((r) => r !== cand && !collisions.includes(r));
+          // shapePage ends with `answerGuidance` then `source`, so the link to
+          // where the answer came from is always the last thing in the reply.
+          return ok({
+            match: presentMatch(cand),
+            ...(collisions.length > 0
+              ? {
+                  nameCollisions: collisions.map(presentMatch),
+                  nameCollisionNote: 'Other entries with the same name; tell them apart by quality and link, not by id.',
+                }
+              : {}),
+            ...(others.length > 0 ? { otherMatches: others.map(presentMatch) } : {}),
+            ...(unusable.length > 0 ? { unusableMatches: unusable } : {}),
+            ...(await shapePage(
+              page,
+              cand.url,
+              { sections, maxRows: maxRows ?? FIND_DEFAULT_ROWS, minChance, minSamples },
+              client,
+            )),
+          });
+        }
+        // Nothing was openable — still never a dead end: hand over the links.
+        return ok(
+          finish(
+            {
+              query: name,
+              matches: results.map(presentMatch),
+              note: 'These entries exist on Wowhead but their pages could not be read right now; give the links and the names.',
+              unusableMatches: unusable,
+            },
+            sourceOf(client.searchUrl(name), 'Wowhead: WoW Forever search'),
+          ),
+        );
       } catch (err) {
         logger.error({ err }, 'forever_find failed');
         return fail(describeError(err));

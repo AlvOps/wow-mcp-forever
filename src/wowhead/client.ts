@@ -418,7 +418,15 @@ export class WowheadClient {
     const canonical =
       /<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i.exec(html)?.[1] ??
       /<meta[^>]+property=["']og:url["'][^>]*content=["']([^"']+)["']/i.exec(html)?.[1];
-    if (canonical) return canonical.includes(`${typePath}=${id}`);
+    if (canonical) {
+      if (canonical.includes(`${typePath}=${id}`)) return true;
+      // Some entities canonicalise to a slug that carries no id at all, and only
+      // for those is `/forever/<type>/` (with the trailing slash) the marker:
+      // guides, e.g. /forever/guide/hall-of-thanes-dungeon-overview-location-rewards.
+      // A listing page (/forever/guides) has no trailing slash, and a soft-404
+      // still canonicalises to the listing, so both stay rejected.
+      return canonical.includes(`/${typePath}/`);
+    }
     // No canonical at all: fall back to the listing-page titles.
     return !/^forever\s+[a-z]+s$/i.test(rawTitle);
   }

@@ -194,6 +194,20 @@ export function presentRow(row: Row, template: string | undefined, ctx: PresentC
   if (friendly) out['friendlyTo'] = friendly;
   if (tpl === 'npc' && typeof row['tag'] === 'string' && row['tag'].trim()) out['subtitle'] = row['tag'].trim();
 
+  // Zones/instances: the site's own Territory / Instance type / Changes / Pop.
+  // columns. Without these a "which Forever dungeons can an Alliance player
+  // run at 20" question has nothing to filter on.
+  if (tpl === 'zone') {
+    for (const k of ['instanceType', 'territory', 'changes'] as const) {
+      const v = row[k];
+      if (typeof v === 'string' && v) out[k] = v;
+    }
+    for (const k of ['players', 'popularity'] as const) {
+      const v = row[k];
+      if (typeof v === 'number' && v > 0) out[k] = v;
+    }
+  }
+
   if (row['dropChance'] !== undefined) out['dropChance'] = row['dropChance'];
   if (typeof row['samples'] === 'number') out['samples'] = row['samples'];
 

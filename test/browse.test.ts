@@ -6,6 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  browseAliasWhere,
   DEAD_PATHS,
   LISTING_SPECS,
   normalizeBrowsePath,
@@ -29,7 +30,7 @@ export const NPCS_HTML = `<html><head><title>Forever NPCs</title></head><body>
 /** JSON-script encoding (as on /forever/zones and /forever/achievements). */
 const ZONES_HTML = `<title>Forever Zones</title>
 <script type="application/json" id="data.page.listPage.gatherer">[]</script>
-<script type="application/json" id="data.page.listPage.listviews">[{"id":"zones","template":"zone","data":[{"id":209,"name":"Shadowfang Keep","minlevel":22,"maxlevel":30,"reqlevel":11,"popularity":2479},{"id":12,"name":"Elwynn Forest","minlevel":1,"maxlevel":10}]}]</script>`;
+<script type="application/json" id="data.page.listPage.listviews">[{"id":"zones","template":"zone","data":[{"id":209,"name":"Shadowfang Keep","minlevel":22,"maxlevel":30,"reqlevel":11,"popularity":2479,"instance":2,"territory":1,"nplayers":5,"envChange":{"status":"unchanged"}},{"id":12,"name":"Elwynn Forest","minlevel":1,"maxlevel":10,"instance":0,"territory":0,"envChange":{"status":"new"}},{"id":16919,"name":"The Hall of Thanes","instance":2,"territory":2,"nplayers":5,"popularity":2446,"envChange":{"status":"new"}}]}]</script>`;
 
 /** Gatherer records only, no listview: the records ARE the rows. */
 const GATHERER_ONLY_HTML = `<title>Forever Achievements</title><script>WH.Gatherer.addData(10, 16, {"64283":{"name_enus":"Played in the {Beta}","icon":"inv_misc_gift_01"},"62054":{"name_enus":"Lord Valthalak Laid to Rest","icon":"x"}});</script>`;
@@ -105,7 +106,7 @@ test('a `note` inside a data row is not mistaken for the table note', () => {
 test('JSON-script listviews (zones/achievements encoding) are parsed', () => {
   const page = parseListingPage(ZONES_HTML);
   assert.equal(page.listviews[0]!.id, 'zones');
-  assert.equal(page.listviews[0]!.rows.length, 2);
+  assert.equal(page.listviews[0]!.rows.length, 3);
 });
 
 test('Filter.init: applied path filters and accepted filter names are read from the page', () => {
@@ -252,8 +253,61 @@ test('JSON-script zones listing is shaped; source stays last after finish()', ()
   const keys = Object.keys(out);
   assert.equal(keys.at(-1), 'source');
   assert.equal(keys.at(-2), 'answerGuidance');
-  assert.deepEqual((out['rows'] as Record<string, unknown>[])[0], { name: 'Shadowfang Keep', url: 'https://www.wowhead.com/forever/zone=209', level: '22-30' });
+  // Zone rows carry the site's own columns: Territory, Instance type, Changes, Pop.
+  assert.deepEqual((out['rows'] as Record<string, unknown>[])[0], {
+    name: 'Shadowfang Keep',
+    url: 'https://www.wowhead.com/forever/zone=209',
+    level: '22-30',
+    instanceType: 'Dungeon',
+    territory: 'Horde',
+    changes: 'Unchanged',
+    players: 5,
+    popularity: 2479,
+  });
   assert.deepEqual(forbiddenKeys(out), []);
+});
+
+test('zones: where filters on the site words (instanceType, territory, changes)', () => {
+  const dungeons = browse(ZONES_HTML, 'zones', { where: { instanceType: 'Dungeon' } });
+  assert.deepEqual(
+    (dungeons['rows'] as Record<string, unknown>[]).map((r) => r['name']).sort(),
+    ['Shadowfang Keep', 'The Hall of Thanes'],
+  );
+  const horde = browse(ZONES_HTML, 'zones', { where: { territory: 'Horde' } });
+  assert.deepEqual((horde['rows'] as Record<string, unknown>[]).map((r) => r['name']), ['Shadowfang Keep']);
+  // "what is new in Forever" — the Changes column, which is how the added
+  // Forever content announces itself.
+  const fresh = browse(ZONES_HTML, 'zones', { where: { changes: 'New' } });
+  assert.deepEqual(
+    (fresh['rows'] as Record<string, unknown>[]).map((r) => r['name']).sort(),
+    ['Elwynn Forest', 'The Hall of Thanes'],
+  );
+  // A friendly alias resolves to the same raw field.
+  const aliased = browse(ZONES_HTML, 'zones', { where: { instancetype: 'dungeon', faction: 'contested' } });
+  assert.deepEqual((aliased['rows'] as Record<string, unknown>[]).map((r) => r['name']), ['The Hall of Thanes']);
+});
+
+test('dungeons/raids/battlegrounds are short names for the zones listing', () => {
+  // Wowhead has no /forever/dungeons page; the alias must resolve to "zones".
+  assert.equal(normalizeBrowsePath('dungeons').path, 'zones');
+  assert.equal(normalizeBrowsePath('FORever/raids').path, 'zones');
+  assert.equal(normalizeBrowsePath('https://www.wowhead.com/forever/battlegrounds').path, 'zones');
+  assert.deepEqual(browseAliasWhere('dungeons'), { instanceType: 'Dungeon' });
+  assert.deepEqual(browseAliasWhere('raids'), { instanceType: 'Raid' });
+  assert.equal(browseAliasWhere('zones'), undefined);
+
+  const body = browse(ZONES_HTML, 'dungeons', { where: { instanceType: 'Dungeon' }, aliasFrom: 'dungeons' });
+  assert.equal(body['aliasedFrom'], 'dungeons');
+  assert.match(String(body['aliasNote']), /narrowed locally by instanceType=Dungeon/);
+  assert.deepEqual(
+    (body['rows'] as Record<string, unknown>[]).map((r) => r['name']).sort(),
+    ['Shadowfang Keep', 'The Hall of Thanes'],
+  );
+});
+
+test('guides is a real listing path with its own spec', () => {
+  assert.equal(specForPath('guides')?.entity, 'guide');
+  assert.equal(specForPath('guides')?.listview, 'guides');
 });
 
 test('rows cap at 200 whatever limit is asked for', () => {
