@@ -32,8 +32,8 @@ Answers are quality-adjusted rather than raw:
 Requires Node.js 20+.
 
 ```bash
-git clone https://github.com/AlvOps/wow-mcp.git
-cd wow-mcp
+git clone https://github.com/AlvOps/wow-mcp-forever.git
+cd wow-mcp-forever
 npm install
 npm run build
 npm run selftest            # live check against Wowhead from this machine
